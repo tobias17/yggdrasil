@@ -2,22 +2,28 @@
 
 Shape (base silhouette):
   * No mid-body bulge: the island is widest at the flat top and tapers
-    monotonically down to a single-voxel point at the bottom — a simple
-    "flat down to a point" silhouette. The taper is fairly aggressive
-    (shape_exponent 1.5), so the sides lean in early and the bottom stays
-    thin.
-  * The point is not necessarily centered: a target is picked at up to 60%
-    of the island radius (default 0.6, random direction). The disk center
-    stays on the island center at the flat top, then drifts towards the
-    target down the body so the tip lands exactly on it — a centered target
-    gives a symmetric cone, a far target leans the body to one side.
-  * A Perlin-like value noise can perturb every row's disk boundary with
-    layered (fBm) lobes so the silhouette varies at the macro level instead
-    of being a perfect solid of revolution. It is OFF by default (the base
-    shape is meant to be honed in on); re-enable with --noise-amp 0.22.
-    When on, the amplitude is a fraction of the row radius, and the flat
-    top row is left clean and the noise fades in over the few rows below
-    it, so the top stays a crisp, flat disc.
+    smoothly down to a single-voxel point at the bottom — a simple
+    "flat down to a point" silhouette. The default taper (shape_exponent
+    1.5) leans the sides in early so the body reads slim rather than
+    bloated; raise the exponent for a longer, thinner point or lower it
+    for a squatter body.
+  * The flat top is a disk with a rough edge, not a perfect circle: the
+    boundary noise below wobbles the circumference at every height,
+    including the top rows (default --noise-amp 0.08 = a slight roughness;
+    0 turns it back into a perfect circle).
+  * The point is not necessarily centered: the tip targets a random point
+    within 50% of the island radius (default 0.5, uniformly in that disk).
+    The disk center stays on the island center at the flat top, then
+    drifts towards the target down the body so the tip lands exactly on
+    it — a centered target gives a symmetric cone, a far target leans the
+    body to one side.
+  * The circumference wobble is Perlin-like value noise, layered (fBm) so
+    the silhouette varies at the macro level instead of being a perfect
+    solid of revolution. Its amplitude is a fraction of the row radius,
+    and the same angular profile is scaled to every row, so the surface
+    stays a smooth wavy solid of revolution with no horizontal layering.
+
+Test sizes: the default run renders d=16 h=16, d=40 h=32, d=80 h=60.
 
 Block layout:
   * Every solid voxel is created as dirt.
@@ -55,32 +61,34 @@ class IslandParams:
 
     diameter        max width of the island in blocks (width at the flat top)
     height          total height in blocks, from the point to the flat top
-    shape_exponent  taper character (default 1.5). 1.0 is a balanced
-                    rounded cone; higher tapers the bottom faster (longer,
-                    thinner point, narrower sides); lower keeps the sides
-                    wider (blunter, squat bottom)
+    shape_exponent  taper character (default 1.5). Higher leans the
+                    sides in early (slimmer body, longer thinner point);
+                    1.0 is a smooth, balanced half-sine (wider, rounder);
+                    lower keeps the sides wide (blunter, squat bottom)
     margin          air padding around the model in blocks
-    spike_center_frac where the spike's tip lands, as a fraction of the
-                    island radius from center, 0..0.6 (0 = perfectly
-                    centered, 0.6 = as far out as allowed). Each island
-                    picks a target point at this distance in a random
-                    direction; as the profile narrows into the spike, the
-                    disk center drifts from the island center to that
-                    point, so the spike skews to one side
+    spike_center_frac max distance of the tip's target point from the
+                    center, as a fraction of the island radius, 0..1
+                    (0 = perfectly centered; default 0.5 = within 50% of
+                    the radius). Each island picks the target as a random
+                    point uniformly inside that disk; as the profile
+                    narrows into the spike, the disk center drifts from
+                    the island center to that point, so the spike skews
+                    to one side
                     (default: random per island; use ``spike_target`` to
                     fix it explicitly)
     spike_target    optional explicit (dx, dz) offset of the spike tip in
                     blocks relative to the island center; overrides
                     spike_center_frac (default: None)
     noise_amp       how much the Perlin-like boundary noise perturbs each
-                    row, as a fraction of that row's radius (default 0 =
-                    off, so the base shape can be honed in on; 0.22 is a
-                    good textured setting; higher = lumps read more
-                    clearly). The flat top row is always left clean and
-                    the noise fades in over the few rows below it
+                    row, as a fraction of that row's radius (default
+                    0.08 = a slight roughness around the circumference;
+                    0 = off, a perfect circle; 0.22 = a heavier texture).
+                    It is applied at full strength to every row,
+                    including the flat top rows, so the disc's edge is
+                    never a perfect circle
     noise_cells     number of large lobes of the boundary noise around the
-                    circumference (default 3); fewer = bigger, smoother
-                    macro lumps
+                    circumference (default 5); fewer = bigger, smoother
+                    macro lumps, more = finer roughness
     noise_octaves   how many octaves of the boundary noise are layered
                     (fBm). 1 = just the smooth macro lobes; 3 = macro lumps
                     plus two finer, smoother detail octaves so the surface
@@ -90,13 +98,13 @@ class IslandParams:
     """
 
     diameter: int = 40
-    height: int = 48
+    height: int = 32
     shape_exponent: float = 1.5
     margin: int = 2
     spike_center_frac: float | None = None
     spike_target: tuple[float, float] | None = None
-    noise_amp: float = 0.0
-    noise_cells: int = 3
+    noise_amp: float = 0.08
+    noise_cells: int = 5
     noise_octaves: int = 3
     noise_seed: int = 0
 
@@ -121,8 +129,9 @@ def island_rows(p: IslandParams) -> tuple[np.ndarray, np.ndarray]:
 
     The center offset stays at (0, 0) on the flat top (the widest row), then
     drifts linearly down towards the spike target so the tip row's disk is
-    centered exactly on it. The target sits at ``spike_center_frac`` of the
-    island radius in a random direction (or at ``spike_target`` if given).
+    centered exactly on it. The target is a random point uniformly inside
+    a disk of radius ``spike_center_frac`` of the island radius (default
+    0.5 = within 50% of the radius), or at ``spike_target`` if given.
     Returns ``(radii, centers)`` with shapes ``(height,)`` and
     ``(height, 2)`` (dx, dz in blocks relative to the island center).
     """
@@ -130,14 +139,16 @@ def island_rows(p: IslandParams) -> tuple[np.ndarray, np.ndarray]:
     t = np.arange(p.height) / (p.height - 1)
     radii = R * np.sin(0.5 * np.pi * np.power(t, p.shape_exponent))
 
-    # spike target: an explicit (dx, dz), or a random point at
-    # spike_center_frac of the radius (default 0.6) in a random direction
+    # spike target: an explicit (dx, dz), or a random point uniformly
+    # inside a disk of radius spike_center_frac of the island radius
+    # (default 0.5 = within 50% of the radius)
     if p.spike_target is not None:
         tx, tz = p.spike_target
     else:
-        frac = 0.6 if p.spike_center_frac is None else p.spike_center_frac
+        frac = 0.5 if p.spike_center_frac is None else p.spike_center_frac
         angle = float(np.random.uniform(0.0, 2.0 * np.pi))
-        tx, tz = R * frac * np.cos(angle), R * frac * np.sin(angle)
+        dist = R * frac * float(np.sqrt(np.random.uniform(0.0, 1.0)))
+        tx, tz = dist * np.cos(angle), dist * np.sin(angle)
 
     # The radius is smallest at the tip row (y=0) and grows to its maximum
     # at the flat top (the widest row), so the profile "starts to narrow"
@@ -219,12 +230,11 @@ def generate_island(p: IslandParams) -> Structure:
     if peak > 0.0:
         profile = profile / peak
 
-    # The flat top row stays clean; the noise ramps from 0 at the top to
-    # full over the few rows below it so the disc edge is crisp. Because the
-    # wobble is the same profile at every height, this ramp stays smooth and
-    # never creates interior grass shelves.
-    fade_rows = max(1, p.height // 12)
-    fade = np.clip((p.height - 1 - np.arange(p.height)) / fade_rows, 0.0, 1.0)
+    # The wobble is applied at full strength to every row, including the
+    # flat top rows, so the disc's circumference is rough rather than a
+    # perfect circle. Because the wobble is the same profile scaled to
+    # each row's radius, the surface stays a smooth wavy solid of
+    # revolution and never creates interior grass shelves.
 
     def row_mask(cx, cz, r, amp_row):
         d2 = (coords[:, None] - cx) ** 2 + (coords[None, :] - cz) ** 2
@@ -245,8 +255,7 @@ def generate_island(p: IslandParams) -> Structure:
     prev_mask, prev_cx, prev_cz = None, None, None
     for y, r in enumerate(radii):
         cx, cz = c + centers[y, 0], c + centers[y, 1]
-        amp = p.noise_amp * fade[y]
-        mask = disk(cx, cz, r, amp)
+        mask = disk(cx, cz, r, p.noise_amp)
         if y > 0 and not np.any(mask & prev_mask):
             # the per-row center drift (or the wobble) outran the (tiny)
             # tip radius and the two rows would not touch: nudge this
@@ -259,7 +268,7 @@ def generate_island(p: IslandParams) -> Structure:
                     break
                 cx += 0.25 * (prev_cx - cx) / step
                 cz += 0.25 * (prev_cz - cz) / step
-                mask = disk(cx, cz, r, amp)
+                mask = disk(cx, cz, r, p.noise_amp)
                 if np.any(mask & prev_mask):
                     break
         data[:, y, :][mask] = dirt
@@ -281,40 +290,46 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--diameter", type=int, nargs="+", default=[16, 40, 80],
+    ap.add_argument("--diameter", type=int, nargs="+", default=None,
                     metavar="D",
                     help="max width(s) in blocks at the flat top; one island "
-                         "per value (default: 16 40 80)")
+                         "per value (default: 16 40 80, paired with the "
+                         "default heights 16 32 60)")
     ap.add_argument("--height", type=int, nargs="+", default=None,
                     help="total height(s) in blocks, point to flat top. "
                          "One value applies to every size; a list is "
-                         "paired with --diameter. If omitted, each island "
-                         "uses height ~= 1.2 * diameter so proportions are "
-                         "kept across sizes.")
+                         "paired with --diameter. If omitted together with "
+                         "--diameter, the default pairs (16,16) (40,32) "
+                         "(80,60) are used; otherwise each island uses "
+                         "height ~= 1.2 * diameter so proportions are kept "
+                         "across sizes.")
     ap.add_argument("--shape-exponent", type=float, default=1.5, dest="shape_exponent",
-                    help="taper character; 1.0 = balanced cone, higher = "
-                         "longer/thinner point (more aggressive taper), "
-                         "lower = wider/squatter (default: 1.5)")
+                    help="taper character; 1.5 = default (leans in early, "
+                         "slim body), higher = longer/thinner point, "
+                         "lower = wider/squatter (1.0 = balanced half-sine)")
     ap.add_argument("--margin", type=int, default=2,
                     help="air padding around the model (default: 2)")
     ap.add_argument("--spike-center-frac", type=float, default=None,
                     dest="spike_center_frac",
-                    help="spike tip distance from center as a fraction of "
-                         "the island radius, 0..0.6; the target point is "
-                         "picked at this distance in a random direction "
-                         "(default: 0.6)")
+                    help="max distance of the tip's target point from the "
+                         "center, as a fraction of the island radius, "
+                         "0..1; the target is a random point uniformly "
+                         "inside that disk (default: 0.5 = within 50% of "
+                         "the radius, 0 = perfectly centered)")
     ap.add_argument("--seed", type=int, default=None,
                     help="random seed for spike target placement and the "
                          "boundary noise; makes runs reproducible "
                          "(default: unseeded)")
-    ap.add_argument("--noise-amp", type=float, default=0.0, dest="noise_amp",
+    ap.add_argument("--noise-amp", type=float, default=0.08, dest="noise_amp",
                     help="boundary noise amplitude as a fraction of the row "
-                         "radius (0 = off, default: 0 so the base shape "
-                         "can be honed in on; 0.22 = textured)")
-    ap.add_argument("--noise-cells", type=int, default=3, dest="noise_cells",
+                         "radius; roughness around the circumference, "
+                         "applied to every row including the flat top "
+                         "(default: 0.08 = slight roughness, 0 = perfect "
+                         "circle, 0.22 = heavier texture)")
+    ap.add_argument("--noise-cells", type=int, default=5, dest="noise_cells",
                     help="number of large lobes of boundary noise around "
                          "the circumference; fewer = bigger, smoother "
-                         "macro lumps (default: 3)")
+                         "macro lumps, more = finer roughness (default: 5)")
     ap.add_argument("--noise-octaves", type=int, default=3, dest="noise_octaves",
                     help="octaves of layered boundary noise (fBm); more = "
                          "finer detail on top of the macro lumps so the "
@@ -331,8 +346,8 @@ def main() -> None:
 
     if args.seed is not None:
         np.random.seed(args.seed)
-    if args.spike_center_frac is not None and not 0.0 <= args.spike_center_frac <= 0.6:
-        ap.error("--spike-center-frac must be in 0..0.6")
+    if args.spike_center_frac is not None and not 0.0 <= args.spike_center_frac <= 1.0:
+        ap.error("--spike-center-frac must be in 0..1")
     if args.noise_amp < 0.0:
         ap.error("--noise-amp must be >= 0")
     if args.noise_cells < 1:
@@ -340,23 +355,33 @@ def main() -> None:
     if args.noise_octaves < 1:
         ap.error("--noise-octaves must be >= 1")
 
-    if args.height is not None and len(args.height) not in (1, len(args.diameter)):
+    # default test sizes: (diameter, height) pairs
+    default_sizes = ((16, 16), (40, 32), (80, 60))
+    if args.diameter is None:
+        diameters = [d for d, _ in default_sizes]
+    else:
+        diameters = args.diameter
+    if args.height is not None and len(args.height) not in (1, len(diameters)):
         ap.error("--height needs one value or one per --diameter")
+    if args.height is None:
+        if args.diameter is None:
+            heights = [h for _, h in default_sizes]
+        else:
+            heights = [int(round(d * 1.2)) for d in diameters]
+    else:
+        heights = args.height
 
     structures, labels = [], []
-    for i, diameter in enumerate(args.diameter):
-        if args.height is None:
-            height = int(round(diameter * 1.2))
-        elif len(args.height) == 1:
-            height = args.height[0]
-        else:
-            height = args.height[i]
+    for i, diameter in enumerate(diameters):
+        height = heights[0] if len(heights) == 1 else heights[i]
         # pick this island's spike target once so the saved model, the
-        # printed tip and the screenshot all agree
-        frac = 0.6 if args.spike_center_frac is None else args.spike_center_frac
+        # printed tip and the screenshot all agree: a random point
+        # uniformly inside a disk of spike_center_frac of the island
+        # radius (default 0.5 = within 50% of the radius)
+        frac = 0.5 if args.spike_center_frac is None else args.spike_center_frac
         angle = float(np.random.uniform(0.0, 2.0 * np.pi))
-        spike_target = (0.5 * diameter * frac * np.cos(angle),
-                        0.5 * diameter * frac * np.sin(angle))
+        dist = 0.5 * diameter * frac * float(np.sqrt(np.random.uniform(0.0, 1.0)))
+        spike_target = (dist * np.cos(angle), dist * np.sin(angle))
         params = IslandParams(
             diameter=diameter,
             height=height,
