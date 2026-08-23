@@ -1,48 +1,43 @@
-"""Generate a simple floating island: a flat top tapering down to a point.
+"""Generate a floating island: a lobed grass cap over a lumpy, asymmetric
+rock body that frays into a fringe of hanging icicles.
 
-Shape (base silhouette):
-  * No mid-body bulge: the island is widest at the flat top and tapers
-    smoothly down to a single-voxel point at the bottom — a simple
-    "flat down to a point" silhouette. The default taper (shape_exponent
-    1.7) leans the sides in early so the body reads slim rather than
-    bloated; raise the exponent for a longer, thinner point or lower it
-    for a squatter body.
-  * The flat top is a disk with a rough edge, not a perfect circle: the
-    boundary noise below wobbles the circumference at every height,
-    including the top rows (default --noise-amp 0.08 = a slight roughness;
-    0 turns it back into a perfect circle).
-  * The point is not necessarily centered: the tip targets a random point
-    within 50% of the island radius (default 0.5, uniformly in that disk).
-    The disk center stays on the island center at the flat top, then
-    drifts towards the target down the body so the tip lands exactly on
-    it — a centered target gives a symmetric cone, a far target leans the
-    body to one side.
-  * The circumference wobble is Perlin-like value noise, layered (fBm) so
-    the silhouette varies at the macro level instead of being a perfect
-    solid of revolution. Its amplitude is a fraction of the row radius,
-    and the same angular profile is scaled to every row, so the surface
-    stays a smooth wavy solid of revolution with no horizontal layering.
-  * A handful of dirt spikes hang from the underside (default on,
-    auto-scaled by disc area: ~1 on d=16, ~5 on d=40, ~20 on d=80).
-    Each anchors just below the local underside surface and hangs
-    straight down, poking out beyond the body like an icicle. Spike
-    size scales with island radius (unit size at d=16), so the big
-    islands get proportionally bigger spikes. They are pure dirt, so
-    the grass rule never touches them. Use --spike-count 0 to turn
-    them off.
-
-Test sizes: the default run renders d=16 h=16, d=40 h=32, d=80 h=60.
+Shape (target silhouette: islands/out/reference.jpg):
+  * The cap -- the top is a roughly circular plateau whose rim is lobed and
+    notched (angular value noise) instead of a perfect circle.
+  * The body -- below the cap the rock tapers smoothly down to a narrow
+    neck. The radius is neck + (R - neck) * sin(pi/2 * t**taper), with its
+    own angular noise (so the cone is lumpy rather than a solid of
+    revolution) and a directional asymmetry term (one side narrows faster
+    than the other).
+  * The neck -- the solid mass ends in a small disk (about 10-20% of the
+    radius) roughly 30-50% of the way down; below it the underside is a
+    fringe, not a point.
+  * The fringe -- a field of thin vertical icicles hangs from the
+    underside: 1-3 blocks wide at the base, tapering to a single-voxel
+    tip, slightly bent and eroded. Each icicle starts a couple of rows
+    inside the body at its column's underside and hangs down. Central
+    columns (near the tip target) reach into the body lowest, so they hang
+    longest; outer columns start higher and are shorter. The silhouette
+    thus frays out of the cone instead of having spikes stuck on it.
+  * The tip -- the lowest point of the fringe is a random point within
+    `tip_frac` of the island radius (default range 0.2..0.55), i.e. the tip
+    target the icicle cluster hangs around; a centered target gives a
+    symmetric fringe, a far target swings the fringe to one side.
+  * Per-island variety -- unless a flag pins a value, every island
+    samples its own parameter set (taper, noise, asymmetry, neck, tip,
+    icicle length and spread), so a batch of islands varies like the
+    reference: spindly ones, stubby ones, notched ones.
 
 Block layout:
   * Every solid voxel is created as dirt.
   * After that, any dirt block with no block directly above it becomes
-    grass (the Minecraft surface rule). This gives a grass cap over the
-    entire top surface and will keep working correctly when more surface
-    detail (spikes, noise) is added later.
+    grass (the Minecraft surface rule): a green cap and nothing else,
+    because every column (body or icicle) is solid top-to-bottom and
+    never widens going down.
 
 Output:
-  * per size   ``islands/out/island_d<D>.npz`` — the model data
-  * combined   ``islands/out/island.png`` — one side-by-side sheet with
+  * per size   ``islands/out/island_d<D>.npz`` -- the model data
+  * combined   ``islands/out/island.png`` -- one side-by-side sheet with
                all sizes, re-rendered on every run so progress can be
                watched in a single image.
 """
@@ -51,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,415 +58,384 @@ if str(REPO_ROOT) not in sys.path:
 
 from utils import Atlas, Structure, render_sheet, value_noise  # noqa: E402
 
-# how far an underhanging spike may poke out beyond the local body
-# surface (blocks) at the reference size; also used to size the grid so
-# nothing gets clipped. Scales with island radius (see SPIKE_REF_RADIUS)
-# so spikes grow proportionally on larger islands.
-MAX_SPIKE_PROTRUSION = 5.0
-# island radius (blocks) at which spikes are "unit" size (d=16); spike
-# width/length/poke are multiplied by R / SPIKE_REF_RADIUS so the big
-# islands get proportionally bigger spikes instead of the same tiny ones
-SPIKE_REF_RADIUS = 8.0
+# Per-island random ranges (low, high) sampled when the corresponding flag
+# is not given explicitly. Values are what a batch of islands "rolls" so
+# the shapes vary like the reference image.
+RANGE_TAPER = (1.3, 2.0)        # taper character of the body
+RANGE_CAP_AMP = (0.15, 0.28)    # cap rim lobing, fraction of the radius
+RANGE_BODY_AMP = (0.10, 0.25)   # body lumpiness, fraction of the radius
+RANGE_ASYM = (0.10, 0.45)       # directional narrowing, fraction of radius
+RANGE_TIP_FRAC = (0.2, 0.55)    # tip target within this fraction of R
+RANGE_NECK_FRAC = (0.3, 0.5)    # fringe zone: bottom fraction of the height
+RANGE_NECK_WIDTH = (0.10, 0.20) # neck radius, fraction of R
+RANGE_ICICLE_LEN = (0.45, 0.65) # max icicle length, fraction of the height
+RANGE_ICICLE_FOOT = (0.35, 0.6) # fringe spread around the tip, fraction of R
+LOBES_CAP = (3, 8)              # cap lobe count range (inclusive low/high)
+LOBES_BODY = (4, 10)
 
 
 @dataclass(frozen=True)
 class IslandParams:
-    """Parameters for the simple teardrop island.
+    """A fully resolved parameter set for one island."""
 
-    diameter        max width of the island in blocks (width at the flat top)
-    height          total height in blocks, from the point to the flat top
-    shape_exponent  taper character (default 1.7). Higher leans the
-                    sides in early (slimmer body, longer thinner point);
-                    1.0 is a smooth, balanced half-sine (wider, rounder);
-                    lower keeps the sides wide (blunter, squat bottom)
-    margin          air padding around the model in blocks
-    spike_center_frac max distance of the tip's target point from the
-                    center, as a fraction of the island radius, 0..1
-                    (0 = perfectly centered; default 0.5 = within 50% of
-                    the radius). Each island picks the target as a random
-                    point uniformly inside that disk; as the profile
-                    narrows into the spike, the disk center drifts from
-                    the island center to that point, so the spike skews
-                    to one side
-                    (default: random per island; use ``spike_target`` to
-                    fix it explicitly)
-    spike_target    optional explicit (dx, dz) offset of the spike tip in
-                    blocks relative to the island center; overrides
-                    spike_center_frac (default: None)
-    noise_amp       how much the Perlin-like boundary noise perturbs each
-                    row, as a fraction of that row's radius (default
-                    0.08 = a slight roughness around the circumference;
-                    0 = off, a perfect circle; 0.22 = a heavier texture).
-                    It is applied at full strength to every row,
-                    including the flat top rows, so the disc's edge is
-                    never a perfect circle
-    noise_cells     number of large lobes of the boundary noise around the
-                    circumference (default 5); fewer = bigger, smoother
-                    macro lumps, more = finer roughness
-    noise_octaves   how many octaves of the boundary noise are layered
-                    (fBm). 1 = just the smooth macro lobes; 3 = macro lumps
-                    plus two finer, smoother detail octaves so the surface
-                    doesn't look like perfectly smooth ovals (default 3)
-    noise_seed      seed for the boundary noise (default 0); combine with
-                    --seed to get a stable layout + stable texture
-    spike_count     how many underhanging spikes hang from the underside
-                    (default None = auto-scale by disc area, see
-                    auto_spike_count; 0 = none)
-    spike_len_min   shortest acceptable spike length in rows, at the
-                    reference size; scaled up by island radius (see
-                    SPIKE_REF_RADIUS) and spikes shorter than that are
-                    skipped (default 3)
-    spike_len_max   longest spike length in rows, at the reference size;
-                    scaled up by island radius (default 7)
-    spike_width     typical spike base radius in blocks, at the reference
-                    size; each spike's base is spike_width * uniform(0.6,
-                    1.4), and everything is scaled up by island radius,
-                    tapering towards a point at the tip (default 1.2)
+    diameter: int          # cap width in blocks (the island's max width)
+    height: int            # total height in blocks, cap to lowest icicle
+    taper: float           # body taper character (see island docstring)
+    cap_amp: float         # cap rim lobing amplitude (fraction of radius)
+    cap_lobes: int         # number of lobes in the cap rim noise
+    body_amp: float        # body lumpiness amplitude (fraction of radius)
+    body_lobes: int        # number of lobes in the body noise
+    asym: float            # directional asymmetry (fraction of radius)
+    asym_dir: float        # direction of the wider side (radians)
+    tip_target: tuple      # (dx, dz) of the tip/fringe center, blocks
+    neck_frac: float       # bottom fraction of the height that is fringe
+    neck_width: float      # neck radius, fraction of R
+    icicle_len_frac: float # max icicle length, fraction of the height
+    icicle_width: float    # typical icicle base radius in blocks
+    icicle_foot: float     # fringe spread radius, fraction of R
+    icicle_count: int      # number of icicles (0 = none)
+    margin: int            # air padding around the model in blocks
+    noise_seed: int        # seed for all of this island's noise
+
+
+def auto_icicle_count(diameter: int) -> int:
+    """Default fringe density: scales with the disc area so small islands
+    get a handful of icicles and big ones a dense fringe
+    (d=16 -> 8, d=40 -> 19, d=80 -> 77)."""
+    return max(8, int(round(0.012 * diameter * diameter)))
+
+
+def sample_params(rng: np.random.Generator, diameter: int, height: int,
+                  o: dict) -> IslandParams:
+    """Resolve an island's parameter set.
+
+    Every entry of ``o`` that is not None is used verbatim (a pinned flag);
+    everything else is sampled from its range with the island's rng, so
+    different islands roll different shapes from the same code.
     """
+    R = 0.5 * diameter
+    taper = o["taper"] if o["taper"] is not None else float(rng.uniform(*RANGE_TAPER))
+    cap_amp = o["cap_amp"] if o["cap_amp"] is not None else float(rng.uniform(*RANGE_CAP_AMP))
+    body_amp = o["body_amp"] if o["body_amp"] is not None else float(rng.uniform(*RANGE_BODY_AMP))
+    asym = o["asym"] if o["asym"] is not None else float(rng.uniform(*RANGE_ASYM))
+    asym_dir = float(rng.uniform(0.0, 2.0 * np.pi))
+    tip_frac = o["tip_frac"] if o["tip_frac"] is not None else float(rng.uniform(*RANGE_TIP_FRAC))
+    ang = float(rng.uniform(0.0, 2.0 * np.pi))
+    dist = R * tip_frac * float(np.sqrt(rng.uniform(0.0, 1.0)))
+    tip_target = (dist * np.cos(ang), dist * np.sin(ang))
+    neck_frac = o["neck_frac"] if o["neck_frac"] is not None else float(rng.uniform(*RANGE_NECK_FRAC))
+    neck_width = o["neck_width"] if o["neck_width"] is not None else float(rng.uniform(*RANGE_NECK_WIDTH))
+    icicle_len_frac = o["icicle_len"] if o["icicle_len"] is not None else float(rng.uniform(*RANGE_ICICLE_LEN))
+    icicle_foot = o["icicle_foot"] if o["icicle_foot"] is not None else float(rng.uniform(*RANGE_ICICLE_FOOT))
+    icicle_width = o["icicle_width"] if o["icicle_width"] is not None else 1.0
+    icicle_count = o["icicle_count"] if o["icicle_count"] is not None else auto_icicle_count(diameter)
+    cap_lobes = int(o["cap_lobes"]) if o["cap_lobes"] is not None else int(rng.integers(*LOBES_CAP))
+    body_lobes = int(o["body_lobes"]) if o["body_lobes"] is not None else int(rng.integers(*LOBES_BODY))
+    noise_seed = int(rng.integers(0, 2**31 - 1))
+    return IslandParams(
+        diameter=diameter, height=height,
+        taper=taper,
+        cap_amp=cap_amp, cap_lobes=cap_lobes,
+        body_amp=body_amp, body_lobes=body_lobes,
+        asym=asym, asym_dir=asym_dir,
+        tip_target=tip_target,
+        neck_frac=neck_frac, neck_width=neck_width,
+        icicle_len_frac=icicle_len_frac, icicle_width=icicle_width,
+        icicle_foot=icicle_foot, icicle_count=icicle_count,
+        margin=o["margin"], noise_seed=noise_seed,
+    )
 
-    diameter: int = 40
-    height: int = 32
-    shape_exponent: float = 1.7
-    margin: int = 2
-    spike_center_frac: float | None = None
-    spike_target: tuple[float, float] | None = None
-    noise_amp: float = 0.08
-    noise_cells: int = 5
-    noise_octaves: int = 3
-    noise_seed: int = 0
-    spike_count: int | None = None
-    spike_len_min: int = 3
-    spike_len_max: int = 7
-    spike_width: float = 1.2
 
+def angular_profile(size: int, c: int, lobes: int, octaves: int,
+                    seed: int) -> np.ndarray:
+    """A zero-mean, peak-normalized 2D angular noise field around the grid
+    center (c, c).
 
-def auto_spike_count(diameter: int) -> int:
-    """Default number of underhanging spikes for a given top diameter.
-
-    Scales with the disc area (d**2 / 320) so the spike density stays
-    roughly constant across sizes: d=16 -> 1, d=40 -> 5, d=80 -> 20.
+    Layered (fBm) periodic value noise of the angle around (c, c): the base
+    octave is the coarse lobes, higher octaves add finer detail. Because
+    every height row scales the same profile, the surface stays a smooth
+    wavy solid of revolution -- wobble in, wobble out, no horizontal
+    banding.
     """
-    return int(round(diameter * diameter / 320))
+    coords = np.arange(size)
+    ang = np.arctan2(coords[None, :] - c, coords[:, None] - c)
+    u = np.mod(ang, 2.0 * np.pi) / (2.0 * np.pi)
+    v = np.full_like(u, 0.5)
+    prof = np.zeros_like(u)
+    weight = 1.0
+    for k in range(max(1, octaves)):
+        cells = max(2, int(round(lobes * (2 ** k))))
+        # cap the finest frequency so a lobe spans a few blocks on small
+        # grids; on tiny islands the fine octaves fall out entirely
+        cells = min(cells, max(3, size // 4))
+        p = value_noise(u, v, cells, 1, seed + 7919 * k, periodic_u=True)
+        p = p - p.mean()
+        peak = float(np.abs(p).max())
+        if peak > 0.0:
+            p = p / peak
+        prof += weight * p
+        weight *= 0.5
+    peak = float(np.abs(prof).max())
+    return prof / peak if peak > 0.0 else prof
 
 
-def island_rows(p: IslandParams) -> tuple[np.ndarray, np.ndarray]:
-    """Per-row (radius, center offset) for every height row, tip (0) to top (-1).
+def _cap_blend(r: float, R: float) -> float:
+    """1.0 in the flat cap, 0.0 deep in the body, smooth in between."""
+    t = (r - 0.8 * R) / (0.2 * R)
+    t = min(1.0, max(0.0, t))
+    return t * t * (3.0 - 2.0 * t)
 
-    The silhouette tapers from a flat top down to a point — no mid-body
-    bulge. The radius is the full island radius at the top row and decreases
-    monotonically to zero at the bottom tip. It is the top half of a smooth
-    drop stretched over the island height:
 
-        r(t) = R * sin(pi/2 * t**shape_exponent)      (t in 0..1, t=0 is the
-                                                       bottom tip)
+def _shoulder_fits(rr: np.ndarray, center: np.ndarray, c: int,
+                   xi: int, zi: int, base_w: float) -> bool:
+    """Whether a disc of radius base_w around grid point (xi, zi) sits fully
+    inside the row boundary rr (measured around the row's center) with a
+    0.5-block margin.
 
-    so r(0) = 0 (a single-voxel point) and r(1) = R (the flat top). Because
-    sin is flat at pi/2, the radius stays very close to R over the top few
-    rows (the "flat" top); because sin is linear at 0, the bottom comes to a
-    clean point. ``shape_exponent`` shapes the taper: 1.0 is a balanced cone;
-    higher keeps the sides narrow for longer (a longer, thinner point); lower
-    widens the body sooner (fatter, rounder).
-
-    The center offset stays at (0, 0) on the flat top (the widest row), then
-    drifts linearly down towards the spike target so the tip row's disk is
-    centered exactly on it. The target is a random point uniformly inside
-    a disk of radius ``spike_center_frac`` of the island radius (default
-    0.5 = within 50% of the radius), or at ``spike_target`` if given.
-    Returns ``(radii, centers)`` with shapes ``(height,)`` and
-    ``(height, 2)`` (dx, dz in blocks relative to the island center).
+    Checked at the point itself and at the disc's two tangent extreme
+    points (the boundary wobbles around the circumference, so a single
+    direction is not enough).
     """
-    R = 0.5 * p.diameter
-    t = np.arange(p.height) / (p.height - 1)
-    radii = R * np.sin(0.5 * np.pi * np.power(t, p.shape_exponent))
-
-    # spike target: an explicit (dx, dz), or a random point uniformly
-    # inside a disk of radius spike_center_frac of the island radius
-    # (default 0.5 = within 50% of the radius)
-    if p.spike_target is not None:
-        tx, tz = p.spike_target
-    else:
-        frac = 0.5 if p.spike_center_frac is None else p.spike_center_frac
-        angle = float(np.random.uniform(0.0, 2.0 * np.pi))
-        dist = R * frac * float(np.sqrt(np.random.uniform(0.0, 1.0)))
-        tx, tz = dist * np.cos(angle), dist * np.sin(angle)
-
-    # The radius is smallest at the tip row (y=0) and grows to its maximum
-    # at the flat top (the widest row), so the profile "starts to narrow"
-    # (going down) at the top. The disk center stays on the island center
-    # at the flat top, then drifts linearly down towards the target so the
-    # tip row's disk is centered exactly on it.
-    widest_row = int(np.argmax(radii))
-    centers = np.zeros((p.height, 2), dtype=float)
-    if widest_row > 0:
-        w = np.clip(1.0 - np.arange(p.height) / widest_row, 0.0, 1.0)
-        centers[:, 0] = tx * w
-        centers[:, 1] = tz * w
-    else:
-        # degenerate: a single row, land the tip on the target
-        centers[0] = (tx, tz)
-
-    return radii, centers
-
-
-def add_underhanging_spikes(
-    data: np.ndarray,
-    p: IslandParams,
-    radii: np.ndarray,
-    centers: np.ndarray,
-    c: int,
-    coords: np.ndarray,
-    size: int,
-    profile: np.ndarray,
-    dirt: int,
-) -> int:
-    """Hang small dirt spikes from the underside of the island body.
-
-    Each spike anchors at a random point on the underside, its base
-    buried below the local (wobbled) surface, and tapers straight down
-    to a point. Width, length and how far it may hang out all scale
-    with the island radius (R / SPIKE_REF_RADIUS), so the big islands
-    get proportionally bigger spikes. A spike is extended row by row
-    only while its outer edge pokes out at most its poke budget beyond
-    the local body surface: as the cone narrows the surface retreats
-    beneath the spike and ends it. All spike voxels are dirt and every
-    spike row is narrower than the one above it, so the grass rule
-    never paints them. Returns the number of spikes actually placed.
-    """
-    if p.spike_count is None:
-        n = auto_spike_count(p.diameter)
-    else:
-        n = p.spike_count
-    if n <= 0:
-        return 0
-
-    # spikes scale with island size: unit size at SPIKE_REF_RADIUS
-    R = 0.5 * p.diameter
-    scale = R / SPIKE_REF_RADIUS
-    len_max = max(1, int(round(p.spike_len_max * scale)))
-    len_min = max(1, int(round(p.spike_len_min * scale)))
-
-    def prof_at(x, z):
-        ix = min(max(int(round(x)), 0), size - 1)
-        iz = min(max(int(round(z)), 0), size - 1)
-        return float(profile[ix, iz])
-
-    def boundary_r(cx, cz, r, ang):
-        # distance from the row's center to its wobbled boundary in
-        # direction ang. The boundary radius r * (1 + amp * profile) is
-        # constant along a ray from the center (the profile depends only
-        # on the column's angle), so it is monotonic and a binary
-        # search finds the crossing.
-        ca, sa = np.cos(ang), np.sin(ang)
-        lo, hi = 0.0, r * (1.0 + p.noise_amp) + 0.5
-        for _ in range(14):
-            mid = 0.5 * (lo + hi)
-            x, z = cx + mid * ca, cz + mid * sa
-            if mid <= r * (1.0 + p.noise_amp * prof_at(x, z)):
-                lo = mid
-            else:
-                hi = mid
-        return 0.5 * (lo + hi)
-
-    # anchor rows: wide enough to bury a base, not the tip rows, and not
-    # the topmost rows (the grass cap stays spike-free). Wider rows are
-    # more likely anchors: their gentler taper lets spikes hang longer,
-    # so the retry budget is spent where spikes actually survive.
-    attach_rows = [y for y in range(2, p.height - 2) if radii[y] >= 2.5]
-    row_w = np.array([radii[y] for y in attach_rows], dtype=float)
-    row_w = row_w / row_w.sum()
-    placed = 0
-    for _ in range(n * 40):  # generous tries: short candidates are skipped
-        if placed >= n or not attach_rows:
-            break
-        y = attach_rows[int(np.random.choice(len(attach_rows), p=row_w))]
-        base_r = p.spike_width * scale * float(np.random.uniform(0.6, 1.4))
-        base_r = min(base_r, 0.45 * radii[y])
-        ang = float(np.random.uniform(0.0, 2.0 * np.pi))
-        ca, sa = np.cos(ang), np.sin(ang)
-        cx0, cz0 = c + centers[y, 0], c + centers[y, 1]
-        s0 = boundary_r(cx0, cz0, radii[y], ang)
-        # base edge sits 0.75 inside the surface: buried even with the
-        # center drift between rows, so the grass rule never sees it
-        d0 = s0 - base_r - 0.75
-        if d0 < 0.25:
-            continue
-        # the whole base disk must be inside the row: the wobble varies
-        # around the circumference, so check the boundary at the disk's
-        # two extreme points (along the tangent at the anchor) too
-        base_ok = True
-        for sgn in (-1.0, 1.0):
-            px = cx0 + d0 * ca - sgn * base_r * sa
-            pz = cz0 + d0 * sa + sgn * base_r * ca
-            d_pt = float(np.hypot(px - cx0, pz - cz0))
-            th = float(np.arctan2(pz - cz0, px - cx0))
-            if d_pt - boundary_r(cx0, cz0, radii[y], th) > -0.25:
-                base_ok = False
-                break
-        if not base_ok:
-            continue
-        # anchor the spike on a fixed grid column (the body's center
-        # drift is negligible at this scale): every spike row then sits
-        # exactly on the one above it, so the spike is a clean nested
-        # cone with no grass specks and no detached voxels
-        ax = c + centers[y, 0] + d0 * ca
-        az = c + centers[y, 1] + d0 * sa
-        # the spike may hang out 2..MAX_SPIKE_PROTRUSION blocks (at the
-        # reference size) beyond the local body surface before the
-        # retreating surface swallows it and the spike ends; scaled up
-        # with island size
-        p_max = float(np.random.uniform(2.0, MAX_SPIKE_PROTRUSION)) * scale
-
-        # grow the spike row by row while it stays within its poke
-        # budget; the lowest row written is row 1, keeping the main tip
-        # row clear
-        length = 0
-        while length < len_max and y - length - 1 >= 1:
-            j = length + 1
-            cjx, cjz = c + centers[y - j, 0], c + centers[y - j, 1]
-            sj = boundary_r(cjx, cjz, radii[y - j], ang)
-            wr_j = max(0.5, base_r * (1.0 - 0.7 * j / (len_max + 1.0)))
-            poke = float(np.hypot(ax - cjx, az - cjz)) + wr_j - sj
-            if poke > p_max:
-                break
-            length = j
-        if length < len_min:
-            continue
-        for j in range(length):
-            wr = max(0.5, base_r * (1.0 - 0.7 * j / (len_max + 1.0)))
-            d2 = (coords[:, None] - ax) ** 2 + (coords[None, :] - az) ** 2
-            data[:, y - j, :][d2 <= wr * wr] = dirt
-        placed += 1
-    return placed
+    cx, cz = c + center[0], c + center[1]
+    d0 = float(np.hypot(xi - cx, zi - cz))
+    if d0 + base_w + 0.5 > float(rr[xi, zi]):
+        return False
+    th = float(np.arctan2(zi - cz, xi - cx))
+    tx_, tz_ = -np.sin(th), np.cos(th)
+    for sgn in (-1.0, 1.0):
+        qx = int(round(xi + sgn * base_w * tx_))
+        qz = int(round(zi + sgn * base_w * tz_))
+        qx = min(max(qx, 0), rr.shape[0] - 1)
+        qz = min(max(qz, 0), rr.shape[1] - 1)
+        d = float(np.hypot(qx - cx, qz - cz))
+        if d + 0.25 > float(rr[qx, qz]):
+            return False
+    return True
 
 
 def generate_island(p: IslandParams) -> tuple[Structure, int]:
-    """Build the island (flat top tapering to a point, with small dirt
-    spikes hanging from the underside) as a Structure of dirt + grass.
-    Returns the structure and the number of spikes actually placed."""
+    """Build the island (lobed cap, lumpy asymmetric body, icicle fringe)
+    as a Structure of dirt + grass. Returns the structure and the number
+    of icicles actually placed."""
     atlas = Atlas()
     dirt = atlas.add("dirt")
     grass = atlas.add("grass")
 
     R = 0.5 * p.diameter
-    # odd grid size so the center column is unambiguous; leave room for
-    # the wobbled edge (up to noise_amp of the radius) and for a spike's
-    # maximum poke-out beyond the body surface (spikes scale with R, so
-    # so does the worst-case poke)
-    scale = R / SPIKE_REF_RADIUS
-    size = int(np.ceil(2 * R * (1.0 + p.noise_amp)
-                       + 2 * MAX_SPIKE_PROTRUSION * scale))
-    size += 2 * p.margin
+    H = p.height
+    # body bottom row: below it the underside is the icicle fringe
+    N = int(round(H * p.neck_frac))
+    N = max(1, min(N, H - 3))
+
+    # neck: a small disk, but wide enough to shoulder the central icicles
+    neck_r = max(R * p.neck_width, p.icicle_width * 0.9 + 0.6)
+
+    # grid: room for the wobbled edge, the off-center tip/fringe and the
+    # icicle bases
+    amp_max = max(p.cap_amp, p.body_amp)
+    size = int(np.ceil(2 * R * (1.5 + amp_max + p.asym) + 4)) + 2 * p.margin
     if size % 2 == 0:
         size += 1
     c = size // 2
 
-    data = np.zeros((size, p.height, size), dtype=np.int16)
-
-    # Per-row (X, Z) disk. The radius profile tapers from the flat top to
-    # the point; the disk center drifts from (0, 0) to the spike target
-    # down the body; and the boundary is perturbed by Perlin-like noise so
-    # the solid stops looking like a perfect solid of revolution.
-    # data[:, y, :] is (X, Z): axis 0 -> X, axis 1 -> Z
+    data = np.zeros((size, H, size), dtype=np.int16)
     coords = np.arange(size)
-    radii, centers = island_rows(p)
 
-    # angle of every grid column around the island center (radians). The
-    # The boundary noise is a few layered, periodic 1D profiles of angle
-    # (Perlin-like value noise, one octave each), summed with decreasing
-    # weight — fBm style. The base octave is the coarse macro lumps; the
-    # higher octaves add smoother fine detail so the surface doesn't read as
-    # a few perfectly smooth ovals. Each octave is applied identically to
-    # every height row, so each row is a scaled copy of the ones above it:
-    # the surface stays a smooth, wavy solid of revolution with no
-    # horizontal layering (a row is never locally wider than the row above
-    # it, so the grass rule never paints interior shelves).
+    # two independent angular noise fields: one for the lobed cap rim, one
+    # for the lumpy body
+    prof_cap = angular_profile(size, c, p.cap_lobes, 3, p.noise_seed)
+    prof_body = angular_profile(size, c, p.body_lobes, 3, p.noise_seed + 999)
     ang = np.arctan2(coords[None, :] - c, coords[:, None] - c)
-    u_ang = np.mod(ang, 2.0 * np.pi) / (2.0 * np.pi)
+    cos_asym = np.cos(ang - p.asym_dir)
 
-    def _octave(cells, seed):
-        prof = value_noise(u_ang, np.full_like(u_ang, 0.5),
-                           cells, 1, seed, periodic_u=True)
-        prof = prof - prof.mean()
-        peak = float(np.abs(prof).max())
-        return prof / peak if peak > 0.0 else prof
+    # -- body radius profile: neck (row N) up to the cap (row H-1) --------
+    # sin is flat at pi/2, so the top stays at full radius over the cap
+    # rows; at the neck it levels off onto a small disk (2 rows wide).
+    t = np.clip((np.arange(H) - N) / (H - 1 - N), 0.0, 1.0)
+    radii = neck_r + (R - neck_r) * np.sin(0.5 * np.pi * np.power(t, p.taper))
+    radii[N + 1] = radii[N]
 
-    # zero-mean + peak-normalize each octave, then sum them with halved
-    # weight per octave (macro dominates, detail is a minor variance) and
-    # renormalize the sum so noise_amp still directly controls the max
-    # wobble: the edge moves at most noise_amp * radius in/out. Each
-    # octave's lobe count is capped so a lobe spans a few blocks — on a
-    # small island the finest octaves fall out, so the surface stays
-    # restrained instead of jutting out block by block.
-    max_cells = max(3, int(R) // 2)
-    profile = np.zeros_like(u_ang)
-    weight = 1.0
-    for k in range(max(1, p.noise_octaves)):
-        cells_k = min(max(2, p.noise_cells * (2 ** k)), max_cells)
-        profile += weight * _octave(cells_k, p.noise_seed + 7919 * k)
-        weight *= 0.5
-    peak = float(np.abs(profile).max())
-    if peak > 0.0:
-        profile = profile / peak
+    # disk center: island center at the cap, drifting to the tip target at
+    # the neck. Smoothstep (zero slope at the top) so the cap rows do not
+    # shear relative to each other.
+    tx, tz = p.tip_target
+    s = np.clip((H - 1 - np.arange(H)) / (H - 1 - N), 0.0, 1.0)
+    s = s * s * (3.0 - 2.0 * s)
+    centers = np.stack([tx * s, tz * s], axis=1)
 
-    # The wobble is applied at full strength to every row, including the
-    # flat top rows, so the disc's circumference is rough rather than a
-    # perfect circle. Because the wobble is the same profile scaled to
-    # each row's radius, the surface stays a smooth wavy solid of
-    # revolution and never creates interior grass shelves.
+    rr_cache: dict[int, np.ndarray] = {}
 
-    def row_mask(cx, cz, r, amp_row):
+    def rr(y: int) -> np.ndarray:
+        """Per-cell boundary radius of body row y (2D, in blocks)."""
+        if y not in rr_cache:
+            w = _cap_blend(radii[y], R)
+            amp = p.body_amp + (p.cap_amp - p.body_amp) * w
+            prof = prof_body + w * (prof_cap - prof_body)
+            rr_cache[y] = radii[y] * (1.0 + amp * prof + p.asym * cos_asym)
+        return rr_cache[y]
+
+    # -- body rows ----------------------------------------------------------
+    # The wobble and the center drift can make a lower row locally wider
+    # than the row above it (the row center can move faster than the
+    # radius grows). Such a bulge paints a stray grass shelf, so every
+    # row's boundary is clamped to sit inside the row above (the triangle
+    # inequality makes S'_y subset of S'_{y+1} for every y):
+    #
+    #     b'[y](p) = min( b[y](p),  b'[y+1](p) - |c[y+1] - c[y]| )
+    #
+    # The raw boundary is kept where it already fits inside the row above;
+    # only cells where the drift outruns the taper get pulled in, by at
+    # most the per-row center shift.
+    cent = centers + c
+    clamped: dict[int, np.ndarray] = {H - 1: rr(H - 1)}
+    for y in range(H - 2, N - 1, -1):
+        dc = float(np.hypot(cent[y + 1, 0] - cent[y, 0],
+                            cent[y + 1, 1] - cent[y, 1]))
+        clamped[y] = np.minimum(rr(y), clamped[y + 1] - dc)
+
+    for y in range(N, H):
+        cx, cz = cent[y, 0], cent[y, 1]
         d2 = (coords[:, None] - cx) ** 2 + (coords[None, :] - cz) ** 2
-        rr = r * (1.0 + amp_row * profile)
-        return d2 <= rr * rr
-
-    def disk(cx, cz, r, amp_row):
-        # row disk; if the radius is too small for the (possibly
-        # non-integer) center to contain any cell — the tip row has r = 0 —
-        # fall back to a single voxel at the rounded center so the tip is
-        # always a real, on-target voxel.
-        m = row_mask(cx, cz, r, amp_row)
-        if not np.any(m):
-            m = np.zeros_like(m)
-            m[int(round(cx)), int(round(cz))] = True
-        return m
-
-    prev_mask, prev_cx, prev_cz = None, None, None
-    for y, r in enumerate(radii):
-        cx, cz = c + centers[y, 0], c + centers[y, 1]
-        mask = disk(cx, cz, r, p.noise_amp)
-        if y > 0 and not np.any(mask & prev_mask):
-            # the per-row center drift (or the wobble) outran the (tiny)
-            # tip radius and the two rows would not touch: nudge this
-            # row's center towards the row below until they share a
-            # voxel. The tip row (y=0) is never moved, so the tip still
-            # lands on target.
-            for _ in range(64):
-                step = np.hypot(prev_cx - cx, prev_cz - cz)
-                if step < 1e-9:
-                    break
-                cx += 0.25 * (prev_cx - cx) / step
-                cz += 0.25 * (prev_cz - cz) / step
-                mask = disk(cx, cz, r, p.noise_amp)
-                if np.any(mask & prev_mask):
-                    break
+        mask = d2 <= clamped[y] ** 2
+        if not np.any(mask):
+            # the (tiny) neck row can fit no cell at its (possibly
+            # non-integer) center: borrow the closest cell of the row
+            # above so the neck stays connected and inside it
+            mask = np.zeros((size, size), dtype=bool)
+            if y > N:
+                d_prev = ((coords[:, None] - (c + centers[y + 1, 0])) ** 2
+                          + (coords[None, :] - (c + centers[y + 1, 1])) ** 2)
+                d_prev = np.where(clamped[y + 1] ** 2 > d_prev,
+                                  d_prev, np.inf)
+                mask[np.unravel_index(np.argmin(d_prev), d_prev.shape)] = True
+            else:
+                mask[int(round(cx)), int(round(cz))] = True
         data[:, y, :][mask] = dirt
-        prev_mask, prev_cx, prev_cz = mask, cx, cz
-
-    # small dirt spikes hanging from the underside (pure dirt; the grass
-    # pass below leaves them alone because every spike block has a solid
-    # block above it)
-    n_spikes = add_underhanging_spikes(data, p, radii, centers, c, coords,
-                                       size, profile, dirt)
 
     # Minecraft rule: dirt with no block directly above becomes grass.
-    # has_above[y] is True where the block one row up is solid.
-    # NOTE: must be a real bool array — an int mask would be interpreted as
+    # The body is monotone (every row is inside the row above), so its
+    # only exposed surface is the top row -- this paints the grass cap.
+    # It runs BEFORE the fringe is drawn: icicles are pure dirt, and an
+    # eroded tip or a bent column could otherwise expose a cell that
+    # would get grass-painted.
+    # NOTE: must be a real bool array -- an int mask would be interpreted as
     # integer indexing, not a boolean mask.
-    has_above = np.zeros(data.shape, dtype=bool)
-    has_above[:, : p.height - 1, :] = data[:, 1:, :] != 0
+    has_above = np.zeros((size, H, size), dtype=bool)
+    has_above[:, : H - 1, :] = data[:, 1:, :] != 0
     data[(data == dirt) & ~has_above] = grass
 
-    return Structure.from_data(data, atlas), n_spikes
+    # -- icicle fringe ------------------------------------------------------
+    placed = 0
+    if p.icicle_count > 0:
+        irng = np.random.default_rng(p.noise_seed + 777)
+        foot = p.icicle_foot * R
+        Lmax = p.icicle_len_frac * H
+        # icicles grow gently with island size (reference look: thin even
+        # on big islands, chunkier on small ones)
+        scale_w = 1.0 + 0.3 * (R / 8.0 - 1.0)
+        txg, tzg = c + tx, c + tz
+
+        tries = 0
+        while placed < p.icicle_count and tries < p.icicle_count * 25:
+            tries += 1
+            # position: uniform in a disc of radius `foot` around the tip
+            # target -- the fringe clusters around where the body points
+            pa = float(irng.uniform(0.0, 2.0 * np.pi))
+            pd = foot * float(np.sqrt(irng.uniform(0.0, 1.0)))
+            px = txg + pd * np.cos(pa)
+            pz = tzg + pd * np.sin(pa)
+            xi, zi = int(round(px)), int(round(pz))
+            if not (0 <= xi < size and 0 <= zi < size):
+                continue
+            base_w = max(0.6, min(3.0,
+                                  p.icicle_width * scale_w
+                                  * float(irng.uniform(0.7, 1.3))))
+            # the underside of this column: the lowest body row whose
+            # ACTUAL (clamped) wobbled boundary still contains the column
+            # with room to bury the icicle shoulder -- testing the real
+            # body guarantees the buried shoulder cells are solid dirt.
+            # Central columns (near the tip target) reach into the body
+            # lowest, so they hang longest; outer columns meet the
+            # body's side higher up, so they are shorter.
+            y_min = None
+            for y in range(N, H):
+                if _shoulder_fits(clamped[y], centers[y], c, xi, zi, base_w):
+                    y_min = y
+                    break
+            if y_min is None:
+                continue
+            y_top = y_min + 2  # shoulder rows buried 2 rows into the body
+            if y_top + 1 >= H - 1:
+                continue
+            if not _shoulder_fits(clamped[y_top + 1], centers[y_top + 1], c,
+                                  xi, zi, base_w):
+                continue
+            # length: the tip row is how far down the fringe this icicle
+            # hangs -- central columns (near the tip target) reach the
+            # lowest row, outer ones end higher up, so the fringe reads
+            # as a shallow bowl with the lowest point near the tip. The
+            # result is clamped to the max icicle length.
+            rho = float(np.hypot(px - txg, pz - tzg))
+            tip_row = int(round(min(N * (rho / foot) ** 1.3
+                                    * float(irng.uniform(0.4, 0.9)),
+                                   max(0.0, y_top - 3))))
+            L = min(y_top - tip_row, int(round(Lmax)))
+            if L < 3:
+                continue
+            # slight bend: the column drifts up to ~1.2 blocks over 10 rows
+            dm = float(irng.uniform(0.0, 1.2)) * L / 10.0
+            da = float(irng.uniform(0.0, 2.0 * np.pi))
+            ddx, ddz = dm * np.cos(da), dm * np.sin(da)
+            for k in range(L + 2):
+                row = y_top + 1 - k
+                f = (k / (L + 2)) ** 1.5
+                wx = px + f * ddx
+                wz = pz + f * ddz
+                # strictly narrowing towards a single-voxel tip (keeps the
+                # grass rule off the icicles); per-row jitter = erosion
+                w = base_w * (1.0 - k / (L + 2)) ** 1.5
+                w = max(0.5, w * float(irng.uniform(0.92, 1.0)))
+                d2 = (coords[:, None] - wx) ** 2 + (coords[None, :] - wz) ** 2
+                m = d2 <= w * w
+                # always include the row's center cell: at the tip the disc
+                # is a single voxel, and a sub-voxel center can otherwise
+                # cover no cell at all (a hole in the column -> a floating
+                # speck). Consecutive center cells are at most 1 apart (the
+                # bend drifts < 0.2 blocks per row), so the column is
+                # connected top to bottom.
+                m[int(round(wx)), int(round(wz))] = True
+                data[:, row, :][m] = dirt
+            placed += 1
+
+    return Structure.from_data(data, atlas), placed
+
+
+def count_floating(data: np.ndarray) -> int:
+    """Number of solid voxels not 26-connected to the top row.
+
+    A healthy island is one connected mass; anything that fails this is a
+    floating speck (a disconnected voxel or cluster).
+    """
+    xs, ys, zs = np.nonzero(data != 0)
+    if xs.size == 0:
+        return 0
+    cells = set(zip(xs.tolist(), ys.tolist(), zs.tolist()))
+    top = int(ys.max())
+    seed = set((x, top, z) for (x, y, z) in cells if y == top)
+    if not seed:
+        return int(xs.size)
+    seen = set(seed)
+    q = deque(seed)
+    while q:
+        x, y, z = q.popleft()
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    n = (x + dx, y + dy, z + dz)
+                    if n in cells and n not in seen:
+                        seen.add(n)
+                        q.append(n)
+    return len(cells) - len(seen)
 
 
 def main() -> None:
@@ -480,98 +445,94 @@ def main() -> None:
     )
     ap.add_argument("--diameter", type=int, nargs="+", default=None,
                     metavar="D",
-                    help="max width(s) in blocks at the flat top; one island "
-                         "per value (default: 16 40 80, paired with the "
-                         "default heights 16 32 60)")
+                    help="cap width(s) in blocks; one island per value "
+                         "(default: 16 40 80, paired with the default "
+                         "heights 16 32 60)")
     ap.add_argument("--height", type=int, nargs="+", default=None,
-                    help="total height(s) in blocks, point to flat top. "
-                         "One value applies to every size; a list is "
-                         "paired with --diameter. If omitted together with "
+                    help="total height(s) in blocks, cap to lowest icicle. "
+                         "One value applies to every size; a list is paired "
+                         "with --diameter. If omitted together with "
                          "--diameter, the default pairs (16,16) (40,32) "
                          "(80,60) are used; otherwise each island uses "
                          "height ~= 1.2 * diameter so proportions are kept "
                          "across sizes.")
-    ap.add_argument("--shape-exponent", type=float, default=1.7, dest="shape_exponent",
-                    help="taper character; 1.7 = default (leans in early, "
-                         "slim body), higher = longer/thinner point, "
-                         "lower = wider/squatter (1.0 = balanced half-sine)")
+    ap.add_argument("--taper", type=float, default=None,
+                    help="body taper character; higher = slimmer body and "
+                         "a longer, thinner neck (default: random per "
+                         "island in 1.3..2.0)")
+    ap.add_argument("--cap-noise", type=float, default=None, dest="cap_noise",
+                    help="cap rim lobing amplitude as a fraction of the "
+                         "radius (default: random per island in 0.15..0.28; "
+                         "0 = a circular rim)")
+    ap.add_argument("--cap-lobes", type=int, default=None, dest="cap_lobes",
+                    help="number of lobes in the cap rim noise (default: "
+                         "random per island in 3..7)")
+    ap.add_argument("--body-noise", type=float, default=None, dest="body_noise",
+                    help="body lumpiness amplitude as a fraction of the "
+                         "radius (default: random per island in 0.10..0.25)")
+    ap.add_argument("--body-lobes", type=int, default=None, dest="body_lobes",
+                    help="number of lobes in the body noise (default: "
+                         "random per island in 4..9)")
+    ap.add_argument("--asym", type=float, default=None,
+                    help="directional asymmetry: one side narrows faster, "
+                         "as a fraction of the radius (default: random per "
+                         "island in 0.10..0.45; 0 = symmetric)")
+    ap.add_argument("--tip-frac", type=float, default=None, dest="tip_frac",
+                    help="max distance of the tip target from the center, "
+                         "as a fraction of the island radius, 0..1 "
+                         "(default: random per island in 0.2..0.55; 0 = "
+                         "perfectly centered)")
+    ap.add_argument("--neck-frac", type=float, default=None, dest="neck_frac",
+                    help="bottom fraction of the height that is the icicle "
+                         "fringe, 0.1..0.7 (default: random per island in "
+                         "0.3..0.5)")
+    ap.add_argument("--neck-width", type=float, default=None, dest="neck_width",
+                    help="neck radius as a fraction of the island radius, "
+                         "0.05..0.35 (default: random per island in "
+                         "0.10..0.20)")
+    ap.add_argument("--icicle-count", type=int, default=None, dest="icicle_count",
+                    help="number of icicles in the fringe; default = "
+                         "auto-scale by disc area (d=16 -> 6, d=40 -> 19, "
+                         "d=80 -> 77); 0 = none")
+    ap.add_argument("--icicle-length", type=float, default=None, dest="icicle_len",
+                    help="max icicle length as a fraction of the island "
+                         "height (default: random per island in 0.45..0.65)")
+    ap.add_argument("--icicle-width", type=float, default=None, dest="icicle_width",
+                    help="typical icicle base radius in blocks; each icicle "
+                         "varies by -30%%/+30%% and grows gently with the "
+                         "island size (default: 1.0)")
+    ap.add_argument("--icicle-footprint", type=float, default=None, dest="icicle_foot",
+                    help="fringe spread radius around the tip target as a "
+                         "fraction of the island radius (default: random "
+                         "per island in 0.35..0.6)")
     ap.add_argument("--margin", type=int, default=2,
                     help="air padding around the model (default: 2)")
-    ap.add_argument("--spike-center-frac", type=float, default=None,
-                    dest="spike_center_frac",
-                    help="max distance of the tip's target point from the "
-                         "center, as a fraction of the island radius, "
-                         "0..1; the target is a random point uniformly "
-                         "inside that disk (default: 0.5 = within 50% of "
-                         "the radius, 0 = perfectly centered)")
     ap.add_argument("--seed", type=int, default=None,
-                    help="random seed for spike target placement and the "
-                         "boundary noise; makes runs reproducible "
+                    help="random seed; makes runs reproducible and each "
+                         "island rolls its own shape from it "
                          "(default: unseeded)")
-    ap.add_argument("--noise-amp", type=float, default=0.08, dest="noise_amp",
-                    help="boundary noise amplitude as a fraction of the row "
-                         "radius; roughness around the circumference, "
-                         "applied to every row including the flat top "
-                         "(default: 0.08 = slight roughness, 0 = perfect "
-                         "circle, 0.22 = heavier texture)")
-    ap.add_argument("--noise-cells", type=int, default=5, dest="noise_cells",
-                    help="number of large lobes of boundary noise around "
-                         "the circumference; fewer = bigger, smoother "
-                         "macro lumps, more = finer roughness (default: 5)")
-    ap.add_argument("--noise-octaves", type=int, default=3, dest="noise_octaves",
-                    help="octaves of layered boundary noise (fBm); more = "
-                         "finer detail on top of the macro lumps so the "
-                         "surface isn't perfectly smooth (default: 3)")
     ap.add_argument("--out-dir", type=Path,
                     default=Path(__file__).parent / "out", dest="out_dir",
                     help="directory for outputs (default: islands/out)")
-    ap.add_argument("--spike-count", type=int, default=None,
-                    dest="spike_count",
-                    help="number of small dirt spikes hanging from the "
-                         "underside; default = auto-scale by disc area "
-                         "(d=16 -> 1, d=40 -> 5, d=80 -> 20); 0 = none")
-    ap.add_argument("--spike-len-min", type=int, default=3,
-                    dest="spike_len_min",
-                    help="shortest acceptable spike length in rows at the "
-                         "reference size (d=16); scaled up by island "
-                         "radius, candidates shorter than that are "
-                         "skipped (default: 3)")
-    ap.add_argument("--spike-len-max", type=int, default=7,
-                    dest="spike_len_max",
-                    help="longest spike length in rows at the reference "
-                         "size (d=16); scaled up by island radius "
-                         "(default: 7)")
-    ap.add_argument("--spike-width", type=float, default=1.2,
-                    dest="spike_width",
-                    help="typical spike base radius in blocks at the "
-                         "reference size (d=16); each spike varies by "
-                         "+/-30%% and everything scales up with island "
-                         "radius (default: 1.2)")
     ap.add_argument("--screenshot", type=Path, default=None,
                     help="combined screenshot path (default: <out-dir>/island.png)")
     ap.add_argument("--no-screenshot", action="store_true",
-                    help="skip rendering all screenshots")
+                    help="skip rendering the screenshot")
     ap.add_argument("--title", type=str, default=None, help="sheet title")
     args = ap.parse_args()
 
-    if args.seed is not None:
-        np.random.seed(args.seed)
-    if args.spike_center_frac is not None and not 0.0 <= args.spike_center_frac <= 1.0:
-        ap.error("--spike-center-frac must be in 0..1")
-    if args.noise_amp < 0.0:
-        ap.error("--noise-amp must be >= 0")
-    if args.noise_cells < 1:
-        ap.error("--noise-cells must be >= 1")
-    if args.noise_octaves < 1:
-        ap.error("--noise-octaves must be >= 1")
-    if args.spike_count is not None and args.spike_count < 0:
-        ap.error("--spike-count must be >= 0")
-    if args.spike_len_min < 2:
-        ap.error("--spike-len-min must be >= 2")
-    if args.spike_len_max < args.spike_len_min:
-        ap.error("--spike-len-max must be >= --spike-len-min")
-    if args.spike_width <= 0.0:
-        ap.error("--spike-width must be > 0")
+    if args.tip_frac is not None and not 0.0 <= args.tip_frac <= 1.0:
+        ap.error("--tip-frac must be in 0..1")
+    if args.asym is not None and args.asym < 0.0:
+        ap.error("--asym must be >= 0")
+    if args.neck_frac is not None and not 0.1 <= args.neck_frac <= 0.7:
+        ap.error("--neck-frac must be in 0.1..0.7")
+    if args.neck_width is not None and not 0.05 <= args.neck_width <= 0.35:
+        ap.error("--neck-width must be in 0.05..0.35")
+    if args.icicle_count is not None and args.icicle_count < 0:
+        ap.error("--icicle-count must be >= 0")
+    if args.icicle_width is not None and args.icicle_width <= 0.0:
+        ap.error("--icicle-width must be > 0")
 
     # default test sizes: (diameter, height) pairs
     default_sizes = ((16, 16), (40, 32), (80, 60))
@@ -589,56 +550,59 @@ def main() -> None:
     else:
         heights = args.height
 
+    o = dict(
+        taper=args.taper,
+        cap_amp=args.cap_noise,
+        cap_lobes=args.cap_lobes,
+        body_amp=args.body_noise,
+        body_lobes=args.body_lobes,
+        asym=args.asym,
+        tip_frac=args.tip_frac,
+        neck_frac=args.neck_frac,
+        neck_width=args.neck_width,
+        icicle_count=args.icicle_count,
+        icicle_len=args.icicle_len,
+        icicle_width=args.icicle_width,
+        icicle_foot=args.icicle_foot,
+        margin=args.margin,
+    )
+
     structures, labels = [], []
     for i, diameter in enumerate(diameters):
         height = heights[0] if len(heights) == 1 else heights[i]
-        # pick this island's spike target once so the saved model, the
-        # printed tip and the screenshot all agree: a random point
-        # uniformly inside a disk of spike_center_frac of the island
-        # radius (default 0.5 = within 50% of the radius)
-        frac = 0.5 if args.spike_center_frac is None else args.spike_center_frac
-        angle = float(np.random.uniform(0.0, 2.0 * np.pi))
-        dist = 0.5 * diameter * frac * float(np.sqrt(np.random.uniform(0.0, 1.0)))
-        spike_target = (dist * np.cos(angle), dist * np.sin(angle))
-        params = IslandParams(
-            diameter=diameter,
-            height=height,
-            shape_exponent=args.shape_exponent,
-            margin=args.margin,
-            spike_target=spike_target,
-            noise_amp=args.noise_amp,
-            noise_cells=args.noise_cells,
-            noise_octaves=args.noise_octaves,
-            noise_seed=(args.seed if args.seed is not None else 0),
-            spike_count=args.spike_count,
-            spike_len_min=args.spike_len_min,
-            spike_len_max=args.spike_len_max,
-            spike_width=args.spike_width,
-        )
-
-        structure, n_spikes = generate_island(params)
+        # each island rolls its own parameter set (and its own noise) from
+        # a per-island rng, so the batch varies like the reference image
+        rng = np.random.default_rng(
+            (args.seed * 1000003 + i) if args.seed is not None else None)
+        params = sample_params(rng, diameter, height, o)
+        structure, n_icicles = generate_island(params)
+        floating = count_floating(structure.data)
         npz_path = args.out_dir / f"island_d{diameter}.npz"
         structure.save(npz_path)
 
         stats = structure.stats()
-        radii, centers = island_rows(params)
+        # where is the lowest point? (the frayed tip of the fringe)
+        xs, ys, zs = np.nonzero(structure.data)
+        y_low = int(ys.min())
+        sel = ys == y_low
         c = structure.shape[0] // 2
-        top_r = radii[-1] / (0.5 * diameter) * 100
-        tip_x, tip_z = c + centers[0, 0], c + centers[0, 1]
-        tip_off = float(np.hypot(centers[0, 0], centers[0, 1]))
+        tip = (float(xs[sel].mean()) - c, float(zs[sel].mean()) - c)
+        tip_off = float(np.hypot(*params.tip_target))
         print(f"d={diameter:<3} h={height:<3} -> {npz_path}   "
               f"blocks={sum(stats.values())} "
               f"(grass={stats['grass']}, dirt={stats['dirt']})   "
-              f"top={top_r:.0f}% of R   "
-              f"spikes={n_spikes}   "
-              f"tip@({tip_x:.1f}, {tip_z:.1f})  (off-center {tip_off:.1f})")
+              f"taper={params.taper:.2f}  asym={params.asym:.2f}   "
+              f"icicles={n_icicles}/{params.icicle_count}   "
+              f"floating={floating}   "
+              f"tip target off-center {tip_off:.1f}  "
+              f"lowest@({tip[0]:.1f}, {tip[1]:.1f}) row {y_low}")
 
         structures.append(structure)
         labels.append(f"d={diameter} h={height}")
 
     if not args.no_screenshot:
         sheet = args.screenshot or args.out_dir / "island.png"
-        title = args.title or "floating island — flat top to a point"
+        title = args.title or "floating island -- lobed cap, lumpy body, icicle fringe"
         render_sheet(structures, sheet, labels=labels, title=title)
         print(f"wrote {sheet}")
 
