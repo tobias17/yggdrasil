@@ -26,6 +26,15 @@ class Structure:
         self.data = np.zeros(tuple(shape), dtype=dtype)
         self.atlas = atlas if atlas is not None else Atlas()
 
+    # -- construction ---------------------------------------------------------
+
+    @classmethod
+    def from_data(cls, data: np.ndarray, atlas: Atlas) -> "Structure":
+        """Wrap an existing (X, Y, Z) integer voxel array."""
+        structure = cls(data.shape, atlas=atlas)
+        structure.data = np.ascontiguousarray(data, dtype=structure.data.dtype)
+        return structure
+
     # -- block access -----------------------------------------------------
 
     def set(self, x: int, y: int, z: int, block: str | int) -> None:
