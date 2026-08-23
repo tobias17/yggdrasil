@@ -4,7 +4,7 @@ Shape (base silhouette):
   * No mid-body bulge: the island is widest at the flat top and tapers
     smoothly down to a single-voxel point at the bottom — a simple
     "flat down to a point" silhouette. The default taper (shape_exponent
-    1.5) leans the sides in early so the body reads slim rather than
+    1.7) leans the sides in early so the body reads slim rather than
     bloated; raise the exponent for a longer, thinner point or lower it
     for a squatter body.
   * The flat top is a disk with a rough edge, not a perfect circle: the
@@ -22,6 +22,14 @@ Shape (base silhouette):
     solid of revolution. Its amplitude is a fraction of the row radius,
     and the same angular profile is scaled to every row, so the surface
     stays a smooth wavy solid of revolution with no horizontal layering.
+  * A handful of dirt spikes hang from the underside (default on,
+    auto-scaled by disc area: ~1 on d=16, ~5 on d=40, ~20 on d=80).
+    Each anchors just below the local underside surface and hangs
+    straight down, poking out beyond the body like an icicle. Spike
+    size scales with island radius (unit size at d=16), so the big
+    islands get proportionally bigger spikes. They are pure dirt, so
+    the grass rule never touches them. Use --spike-count 0 to turn
+    them off.
 
 Test sizes: the default run renders d=16 h=16, d=40 h=32, d=80 h=60.
 
@@ -54,6 +62,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from utils import Atlas, Structure, render_sheet, value_noise  # noqa: E402
 
+# how far an underhanging spike may poke out beyond the local body
+# surface (blocks) at the reference size; also used to size the grid so
+# nothing gets clipped. Scales with island radius (see SPIKE_REF_RADIUS)
+# so spikes grow proportionally on larger islands.
+MAX_SPIKE_PROTRUSION = 5.0
+# island radius (blocks) at which spikes are "unit" size (d=16); spike
+# width/length/poke are multiplied by R / SPIKE_REF_RADIUS so the big
+# islands get proportionally bigger spikes instead of the same tiny ones
+SPIKE_REF_RADIUS = 8.0
+
 
 @dataclass(frozen=True)
 class IslandParams:
@@ -61,7 +79,7 @@ class IslandParams:
 
     diameter        max width of the island in blocks (width at the flat top)
     height          total height in blocks, from the point to the flat top
-    shape_exponent  taper character (default 1.5). Higher leans the
+    shape_exponent  taper character (default 1.7). Higher leans the
                     sides in early (slimmer body, longer thinner point);
                     1.0 is a smooth, balanced half-sine (wider, rounder);
                     lower keeps the sides wide (blunter, squat bottom)
@@ -95,11 +113,24 @@ class IslandParams:
                     doesn't look like perfectly smooth ovals (default 3)
     noise_seed      seed for the boundary noise (default 0); combine with
                     --seed to get a stable layout + stable texture
+    spike_count     how many underhanging spikes hang from the underside
+                    (default None = auto-scale by disc area, see
+                    auto_spike_count; 0 = none)
+    spike_len_min   shortest acceptable spike length in rows, at the
+                    reference size; scaled up by island radius (see
+                    SPIKE_REF_RADIUS) and spikes shorter than that are
+                    skipped (default 3)
+    spike_len_max   longest spike length in rows, at the reference size;
+                    scaled up by island radius (default 7)
+    spike_width     typical spike base radius in blocks, at the reference
+                    size; each spike's base is spike_width * uniform(0.6,
+                    1.4), and everything is scaled up by island radius,
+                    tapering towards a point at the tip (default 1.2)
     """
 
     diameter: int = 40
     height: int = 32
-    shape_exponent: float = 1.5
+    shape_exponent: float = 1.7
     margin: int = 2
     spike_center_frac: float | None = None
     spike_target: tuple[float, float] | None = None
@@ -107,6 +138,19 @@ class IslandParams:
     noise_cells: int = 5
     noise_octaves: int = 3
     noise_seed: int = 0
+    spike_count: int | None = None
+    spike_len_min: int = 3
+    spike_len_max: int = 7
+    spike_width: float = 1.2
+
+
+def auto_spike_count(diameter: int) -> int:
+    """Default number of underhanging spikes for a given top diameter.
+
+    Scales with the disc area (d**2 / 320) so the spike density stays
+    roughly constant across sizes: d=16 -> 1, d=40 -> 5, d=80 -> 20.
+    """
+    return int(round(diameter * diameter / 320))
 
 
 def island_rows(p: IslandParams) -> tuple[np.ndarray, np.ndarray]:
@@ -168,16 +212,154 @@ def island_rows(p: IslandParams) -> tuple[np.ndarray, np.ndarray]:
     return radii, centers
 
 
-def generate_island(p: IslandParams) -> Structure:
-    """Build the island (flat top tapering to a point) as a Structure of
-    dirt + grass."""
+def add_underhanging_spikes(
+    data: np.ndarray,
+    p: IslandParams,
+    radii: np.ndarray,
+    centers: np.ndarray,
+    c: int,
+    coords: np.ndarray,
+    size: int,
+    profile: np.ndarray,
+    dirt: int,
+) -> int:
+    """Hang small dirt spikes from the underside of the island body.
+
+    Each spike anchors at a random point on the underside, its base
+    buried below the local (wobbled) surface, and tapers straight down
+    to a point. Width, length and how far it may hang out all scale
+    with the island radius (R / SPIKE_REF_RADIUS), so the big islands
+    get proportionally bigger spikes. A spike is extended row by row
+    only while its outer edge pokes out at most its poke budget beyond
+    the local body surface: as the cone narrows the surface retreats
+    beneath the spike and ends it. All spike voxels are dirt and every
+    spike row is narrower than the one above it, so the grass rule
+    never paints them. Returns the number of spikes actually placed.
+    """
+    if p.spike_count is None:
+        n = auto_spike_count(p.diameter)
+    else:
+        n = p.spike_count
+    if n <= 0:
+        return 0
+
+    # spikes scale with island size: unit size at SPIKE_REF_RADIUS
+    R = 0.5 * p.diameter
+    scale = R / SPIKE_REF_RADIUS
+    len_max = max(1, int(round(p.spike_len_max * scale)))
+    len_min = max(1, int(round(p.spike_len_min * scale)))
+
+    def prof_at(x, z):
+        ix = min(max(int(round(x)), 0), size - 1)
+        iz = min(max(int(round(z)), 0), size - 1)
+        return float(profile[ix, iz])
+
+    def boundary_r(cx, cz, r, ang):
+        # distance from the row's center to its wobbled boundary in
+        # direction ang. The boundary radius r * (1 + amp * profile) is
+        # constant along a ray from the center (the profile depends only
+        # on the column's angle), so it is monotonic and a binary
+        # search finds the crossing.
+        ca, sa = np.cos(ang), np.sin(ang)
+        lo, hi = 0.0, r * (1.0 + p.noise_amp) + 0.5
+        for _ in range(14):
+            mid = 0.5 * (lo + hi)
+            x, z = cx + mid * ca, cz + mid * sa
+            if mid <= r * (1.0 + p.noise_amp * prof_at(x, z)):
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    # anchor rows: wide enough to bury a base, not the tip rows, and not
+    # the topmost rows (the grass cap stays spike-free). Wider rows are
+    # more likely anchors: their gentler taper lets spikes hang longer,
+    # so the retry budget is spent where spikes actually survive.
+    attach_rows = [y for y in range(2, p.height - 2) if radii[y] >= 2.5]
+    row_w = np.array([radii[y] for y in attach_rows], dtype=float)
+    row_w = row_w / row_w.sum()
+    placed = 0
+    for _ in range(n * 40):  # generous tries: short candidates are skipped
+        if placed >= n or not attach_rows:
+            break
+        y = attach_rows[int(np.random.choice(len(attach_rows), p=row_w))]
+        base_r = p.spike_width * scale * float(np.random.uniform(0.6, 1.4))
+        base_r = min(base_r, 0.45 * radii[y])
+        ang = float(np.random.uniform(0.0, 2.0 * np.pi))
+        ca, sa = np.cos(ang), np.sin(ang)
+        cx0, cz0 = c + centers[y, 0], c + centers[y, 1]
+        s0 = boundary_r(cx0, cz0, radii[y], ang)
+        # base edge sits 0.75 inside the surface: buried even with the
+        # center drift between rows, so the grass rule never sees it
+        d0 = s0 - base_r - 0.75
+        if d0 < 0.25:
+            continue
+        # the whole base disk must be inside the row: the wobble varies
+        # around the circumference, so check the boundary at the disk's
+        # two extreme points (along the tangent at the anchor) too
+        base_ok = True
+        for sgn in (-1.0, 1.0):
+            px = cx0 + d0 * ca - sgn * base_r * sa
+            pz = cz0 + d0 * sa + sgn * base_r * ca
+            d_pt = float(np.hypot(px - cx0, pz - cz0))
+            th = float(np.arctan2(pz - cz0, px - cx0))
+            if d_pt - boundary_r(cx0, cz0, radii[y], th) > -0.25:
+                base_ok = False
+                break
+        if not base_ok:
+            continue
+        # anchor the spike on a fixed grid column (the body's center
+        # drift is negligible at this scale): every spike row then sits
+        # exactly on the one above it, so the spike is a clean nested
+        # cone with no grass specks and no detached voxels
+        ax = c + centers[y, 0] + d0 * ca
+        az = c + centers[y, 1] + d0 * sa
+        # the spike may hang out 2..MAX_SPIKE_PROTRUSION blocks (at the
+        # reference size) beyond the local body surface before the
+        # retreating surface swallows it and the spike ends; scaled up
+        # with island size
+        p_max = float(np.random.uniform(2.0, MAX_SPIKE_PROTRUSION)) * scale
+
+        # grow the spike row by row while it stays within its poke
+        # budget; the lowest row written is row 1, keeping the main tip
+        # row clear
+        length = 0
+        while length < len_max and y - length - 1 >= 1:
+            j = length + 1
+            cjx, cjz = c + centers[y - j, 0], c + centers[y - j, 1]
+            sj = boundary_r(cjx, cjz, radii[y - j], ang)
+            wr_j = max(0.5, base_r * (1.0 - 0.7 * j / (len_max + 1.0)))
+            poke = float(np.hypot(ax - cjx, az - cjz)) + wr_j - sj
+            if poke > p_max:
+                break
+            length = j
+        if length < len_min:
+            continue
+        for j in range(length):
+            wr = max(0.5, base_r * (1.0 - 0.7 * j / (len_max + 1.0)))
+            d2 = (coords[:, None] - ax) ** 2 + (coords[None, :] - az) ** 2
+            data[:, y - j, :][d2 <= wr * wr] = dirt
+        placed += 1
+    return placed
+
+
+def generate_island(p: IslandParams) -> tuple[Structure, int]:
+    """Build the island (flat top tapering to a point, with small dirt
+    spikes hanging from the underside) as a Structure of dirt + grass.
+    Returns the structure and the number of spikes actually placed."""
     atlas = Atlas()
     dirt = atlas.add("dirt")
     grass = atlas.add("grass")
 
     R = 0.5 * p.diameter
-    # odd grid size so the center column is unambiguous
-    size = int(np.ceil(2 * R)) + 2 * p.margin
+    # odd grid size so the center column is unambiguous; leave room for
+    # the wobbled edge (up to noise_amp of the radius) and for a spike's
+    # maximum poke-out beyond the body surface (spikes scale with R, so
+    # so does the worst-case poke)
+    scale = R / SPIKE_REF_RADIUS
+    size = int(np.ceil(2 * R * (1.0 + p.noise_amp)
+                       + 2 * MAX_SPIKE_PROTRUSION * scale))
+    size += 2 * p.margin
     if size % 2 == 0:
         size += 1
     c = size // 2
@@ -274,6 +456,12 @@ def generate_island(p: IslandParams) -> Structure:
         data[:, y, :][mask] = dirt
         prev_mask, prev_cx, prev_cz = mask, cx, cz
 
+    # small dirt spikes hanging from the underside (pure dirt; the grass
+    # pass below leaves them alone because every spike block has a solid
+    # block above it)
+    n_spikes = add_underhanging_spikes(data, p, radii, centers, c, coords,
+                                       size, profile, dirt)
+
     # Minecraft rule: dirt with no block directly above becomes grass.
     # has_above[y] is True where the block one row up is solid.
     # NOTE: must be a real bool array — an int mask would be interpreted as
@@ -282,7 +470,7 @@ def generate_island(p: IslandParams) -> Structure:
     has_above[:, : p.height - 1, :] = data[:, 1:, :] != 0
     data[(data == dirt) & ~has_above] = grass
 
-    return Structure.from_data(data, atlas)
+    return Structure.from_data(data, atlas), n_spikes
 
 
 def main() -> None:
@@ -303,8 +491,8 @@ def main() -> None:
                          "(80,60) are used; otherwise each island uses "
                          "height ~= 1.2 * diameter so proportions are kept "
                          "across sizes.")
-    ap.add_argument("--shape-exponent", type=float, default=1.5, dest="shape_exponent",
-                    help="taper character; 1.5 = default (leans in early, "
+    ap.add_argument("--shape-exponent", type=float, default=1.7, dest="shape_exponent",
+                    help="taper character; 1.7 = default (leans in early, "
                          "slim body), higher = longer/thinner point, "
                          "lower = wider/squatter (1.0 = balanced half-sine)")
     ap.add_argument("--margin", type=int, default=2,
@@ -337,6 +525,28 @@ def main() -> None:
     ap.add_argument("--out-dir", type=Path,
                     default=Path(__file__).parent / "out", dest="out_dir",
                     help="directory for outputs (default: islands/out)")
+    ap.add_argument("--spike-count", type=int, default=None,
+                    dest="spike_count",
+                    help="number of small dirt spikes hanging from the "
+                         "underside; default = auto-scale by disc area "
+                         "(d=16 -> 1, d=40 -> 5, d=80 -> 20); 0 = none")
+    ap.add_argument("--spike-len-min", type=int, default=3,
+                    dest="spike_len_min",
+                    help="shortest acceptable spike length in rows at the "
+                         "reference size (d=16); scaled up by island "
+                         "radius, candidates shorter than that are "
+                         "skipped (default: 3)")
+    ap.add_argument("--spike-len-max", type=int, default=7,
+                    dest="spike_len_max",
+                    help="longest spike length in rows at the reference "
+                         "size (d=16); scaled up by island radius "
+                         "(default: 7)")
+    ap.add_argument("--spike-width", type=float, default=1.2,
+                    dest="spike_width",
+                    help="typical spike base radius in blocks at the "
+                         "reference size (d=16); each spike varies by "
+                         "+/-30%% and everything scales up with island "
+                         "radius (default: 1.2)")
     ap.add_argument("--screenshot", type=Path, default=None,
                     help="combined screenshot path (default: <out-dir>/island.png)")
     ap.add_argument("--no-screenshot", action="store_true",
@@ -354,6 +564,14 @@ def main() -> None:
         ap.error("--noise-cells must be >= 1")
     if args.noise_octaves < 1:
         ap.error("--noise-octaves must be >= 1")
+    if args.spike_count is not None and args.spike_count < 0:
+        ap.error("--spike-count must be >= 0")
+    if args.spike_len_min < 2:
+        ap.error("--spike-len-min must be >= 2")
+    if args.spike_len_max < args.spike_len_min:
+        ap.error("--spike-len-max must be >= --spike-len-min")
+    if args.spike_width <= 0.0:
+        ap.error("--spike-width must be > 0")
 
     # default test sizes: (diameter, height) pairs
     default_sizes = ((16, 16), (40, 32), (80, 60))
@@ -392,9 +610,13 @@ def main() -> None:
             noise_cells=args.noise_cells,
             noise_octaves=args.noise_octaves,
             noise_seed=(args.seed if args.seed is not None else 0),
+            spike_count=args.spike_count,
+            spike_len_min=args.spike_len_min,
+            spike_len_max=args.spike_len_max,
+            spike_width=args.spike_width,
         )
 
-        structure = generate_island(params)
+        structure, n_spikes = generate_island(params)
         npz_path = args.out_dir / f"island_d{diameter}.npz"
         structure.save(npz_path)
 
@@ -408,6 +630,7 @@ def main() -> None:
               f"blocks={sum(stats.values())} "
               f"(grass={stats['grass']}, dirt={stats['dirt']})   "
               f"top={top_r:.0f}% of R   "
+              f"spikes={n_spikes}   "
               f"tip@({tip_x:.1f}, {tip_z:.1f})  (off-center {tip_off:.1f})")
 
         structures.append(structure)
