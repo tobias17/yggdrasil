@@ -4,4 +4,4 @@ __pycache__/
 .venv/
 
 # Generated output
-islands/out/
+*/out/
