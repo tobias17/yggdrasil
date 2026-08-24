@@ -73,10 +73,8 @@ def value_noise_2d(res, grid_size, seed):
 # ---------------------------------------------------------------------------
 
 STONE_VARIANTS = [
-    ("minecraft:stone", 0.80),
-    ("minecraft:andesite", 0.08),
-    ("minecraft:deepslate", 0.06),
-    ("minecraft:mossy_cobblestone", 0.06),
+    ("minecraft:stone", 0.85),
+    ("minecraft:andesite", 0.15),
 ]
 
 
@@ -119,16 +117,25 @@ def generate_island(seed=0, diameter=40, top_thickness=3, max_depth=14,
     thetas = np.linspace(0, 2 * np.pi, 360, endpoint=False)
     R = np.full(360, float(radius))
     for k in range(2, 6):
-        amp = radius * np_rng.uniform(0.03, 0.09)
+        amp = radius * np_rng.uniform(0.015, 0.045)
         phase = np_rng.uniform(0, 2 * np.pi)
         R += amp * np.sin(k * thetas + phase)
     R = np.clip(R, radius * 0.55, None)
 
-    edge_noise = value_noise_2d(size, 8, seed + 1) * (radius * 0.10)
+    edge_noise = value_noise_2d(size, 8, seed + 1) * (radius * 0.05)
     hill_noise = value_noise_2d(size, 6, seed + 2)
-    depth_noise = value_noise_2d(size, 10, seed + 3)
+    # per-column jitter on the taper radius so the underside isn't a
+    # perfectly smooth cone
+    taper_noise = value_noise_2d(size, 10, seed + 3) * (radius * 0.12)
 
-    columns = []  # (x, z, topY, depth, r, localR)
+    # how much the body's radius shrinks from just-under-the-dirt (t=0) down
+    # to max_depth (t=1). >0 means it starts narrowing immediately rather
+    # than staying full-width for the first several layers.
+    TAPER_STRENGTH = 0.55
+
+    blocks = {}
+    col_bottom = {}
+    columns = []  # (x, z, topY, depth, r, localR) - depth is the carved depth
     for xi in range(size):
         for zi in range(size):
             x, z = xi - half, zi - half
@@ -139,24 +146,34 @@ def generate_island(seed=0, diameter=40, top_thickness=3, max_depth=14,
             if r > localR:
                 continue
             topY = 0 if flat_top else int(round(hill_noise[xi, zi] * 2.2))
-            falloff = max(0.0, 1 - (r / localR) ** 2)
-            depth = int(max_depth * (falloff ** 0.6) + max(0, depth_noise[xi, zi]) * 4)
-            depth = max(depth, 2)
+
+            blocks[(x, topY, z)] = "minecraft:grass_block"
+            for dy in range(1, top_thickness):
+                blocks[(x, topY - dy, z)] = "minecraft:dirt"
+
+            # Carve the rock body: at each step down, the allowed radius
+            # shrinks (taper), so columns near the current edge drop out
+            # first while the center keeps going - giving continuous
+            # narrowing instead of a flat plateau then a sudden cliff.
+            body_top = topY - top_thickness
+            jitter = taper_noise[xi, zi]
+            bottomY = body_top
+            for y_offset in range(0, max_depth + 1):
+                t = y_offset / max_depth
+                allowed_r = localR * (1 - TAPER_STRENGTH * t) + jitter
+                if y_offset > 0 and r > max(allowed_r, 0):
+                    break
+                y = body_top - y_offset
+                blocks[(x, y, z)] = pick_stone(rng)
+                bottomY = y
+
+            depth = body_top - bottomY
+            col_bottom[(x, z)] = (bottomY, topY, r, localR)
             columns.append((x, z, topY, depth, r, localR))
 
-    blocks = {}
-    col_bottom = {}
-    for (x, z, topY, depth, r, localR) in columns:
-        blocks[(x, topY, z)] = "minecraft:grass_block"
-        for dy in range(1, top_thickness):
-            blocks[(x, topY - dy, z)] = "minecraft:dirt"
-        bottomY = topY - top_thickness - depth
-        col_bottom[(x, z)] = (bottomY, topY, r, localR)
-        for y in range(bottomY, topY - top_thickness):
-            blocks[(x, y, z)] = pick_stone(rng)
-        # occasional moss cap on the very bottom face near the edge
-        if r / localR > 0.65 and rng.random() < 0.35:
-            blocks[(x, bottomY, z)] = "minecraft:moss_block"
+            # occasional moss cap on the very bottom face near the edge
+            if r / localR > 0.65 and rng.random() < 0.35:
+                blocks[(x, bottomY, z)] = "minecraft:mossy_cobblestone"
 
     if decorate_underside:
         # thin hanging root/stalactite drips, mostly toward the edges
@@ -175,7 +192,7 @@ def generate_island(seed=0, diameter=40, top_thickness=3, max_depth=14,
                             block = "minecraft:mossy_cobblestone" if dl > drip_len - 3 else "minecraft:stone"
                             blocks[(x + dx, y, z + dz)] = block
             if rng.random() < 0.6:
-                blocks[(x, bottomY - drip_len - 1, z)] = "minecraft:vine"
+                blocks[(x, bottomY - drip_len, z)] = "minecraft:vine"
 
         # vines draped down from the underside near the outer rim
         for (x, z, topY, depth, r, localR) in columns:
@@ -279,9 +296,7 @@ BLOCK_COLORS = {
     "minecraft:dirt": "#6b4a2b",
     "minecraft:stone": "#8a8a8a",
     "minecraft:andesite": "#a3a3a0",
-    "minecraft:deepslate": "#3f3f45",
     "minecraft:mossy_cobblestone": "#5e6b4a",
-    "minecraft:moss_block": "#4a7a2a",
     "minecraft:vine": "#3f6b2a",
     "minecraft:oak_log": "#5a3d1f",
     "minecraft:oak_leaves": "#3f7a2f",
