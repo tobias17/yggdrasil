@@ -7,12 +7,12 @@ tapering rocky underside, hanging "root" stalactites, moss/vine
 decoration) in the style of concept-art floating islands.
 
 Outputs:
-  1. A plain block-list (CSV + JSON): universal (x, y, z, block_id) format
-     you can feed into any importer/mod/plugin you write yourself.
-  2. A .schem file (Sponge schematic) you can drop straight into a
-     Minecraft world with WorldEdit: //schem load <name>  then  //paste
-  3. A 3D voxel preview image (and interactive matplotlib window) so you
-     can check the shape BEFORE generating/pasting anything in-game.
+  1. A .npz model file in the project's canonical format: a 3D numpy
+     array of int16 block indices (X, Y, Z with Y up, 0 = air) plus a
+     JSON atlas legend naming each index - the same format as
+     islands_old/generate.py.
+  2. A 3D preview image rendered as full shaded blocks so you can check
+     the shape BEFORE building anything in-game.
 
 No external world/game connection is needed to preview - this is pure
 geometry + a plotting library.
@@ -20,7 +20,6 @@ geometry + a plotting library.
 Usage:
     python floating_islands.py --diameter 40           # single island, flat 40-block-wide top
     python floating_islands.py --diameter 40 --seed 7  # different random variation, same size
-    python floating_islands.py --diameter 40 --show    # also pop up an interactive 3D window
     python floating_islands.py --scene                 # old multi-island demo composition
 
 By default the island has a perfectly FLAT top (single Y level) so it's
@@ -29,11 +28,18 @@ the underside tapers down into rock with hanging root/stalactite drips.
 """
 
 import argparse
-import json
-import csv
 import math
 import random
+import sys
+from pathlib import Path
+
 import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from utils import Atlas, Structure, render_screenshot  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -242,26 +248,26 @@ def generate_scene(seed=0):
 # Export
 # ---------------------------------------------------------------------------
 
-def export_block_list(blocks, csv_path, json_path):
-    rows = [{"x": x, "y": y, "z": z, "block": b} for (x, y, z), b in blocks.items()]
-    with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["x", "y", "z", "block"])
-        w.writeheader()
-        w.writerows(rows)
-    with open(json_path, "w") as f:
-        json.dump(rows, f)
-    return len(rows)
-
-
-def export_schem(blocks, path):
-    """Writes a Sponge .schem WorldEdit can load directly:
-    //schem load <name>   then   //paste
-    """
-    import mcschematic
-    schem = mcschematic.MCSchematic()
-    for (x, y, z), block in blocks.items():
-        schem.setBlock((x, y, z), block)
-    schem.save("", path, mcschematic.Version.JE_1_20_1)
+def blocks_to_structure(blocks):
+    """Converts a {(x, y, z): "minecraft:block_id"} dict to the project's
+    canonical Structure: a 3D numpy array of int16 block indices
+    (X, Y, Z with Y up, 0 = air) plus an Atlas naming each index.
+    Coordinates are shifted so the bounding box starts at the origin."""
+    items = list(blocks.items())
+    atlas = Atlas()
+    indices = {name: atlas.add(name) for name in sorted({b for _, b in items})}
+    xs = np.array([k[0] for k, _ in items])
+    ys = np.array([k[1] for k, _ in items])
+    zs = np.array([k[2] for k, _ in items])
+    origin = (int(xs.min()), int(ys.min()), int(zs.min()))
+    shape = (int(xs.max()) - origin[0] + 1,
+             int(ys.max()) - origin[1] + 1,
+             int(zs.max()) - origin[2] + 1)
+    data = np.zeros(shape, dtype=np.int16)
+    data[xs - origin[0], ys - origin[1], zs - origin[2]] = (
+        np.array([indices[b] for _, b in items], dtype=np.int16)
+    )
+    return Structure.from_data(data, atlas)
 
 
 # ---------------------------------------------------------------------------
@@ -286,54 +292,18 @@ BLOCK_COLORS = {
 }
 
 
-def preview(blocks, out_path="preview.png", show=False, max_blocks=45000):
-    import matplotlib.pyplot as plt
-
-    items = list(blocks.items())
-    if len(items) > max_blocks:
-        # thin out for a manageable preview render (keeps the shape, drops density)
-        step = math.ceil(len(items) / max_blocks)
-        items = items[::step]
-
-    xs = np.array([p[0][0] for p in items])
-    ys = np.array([p[0][1] for p in items])
-    zs = np.array([p[0][2] for p in items])
-    colors = [BLOCK_COLORS.get(p[1], "#999999") for p in items]
-
-    fig = plt.figure(figsize=(15, 7))
-
-    # --- 3D angled view ---
-    ax = fig.add_subplot(121, projection="3d")
-    # Minecraft Y is "up" -> plot (x, z, y) so the vertical axis reads naturally
-    ax.scatter(xs, zs, ys, c=colors, marker="s", s=6, depthshade=True, linewidths=0)
-    ax.set_xlabel("X")
-    ax.set_ylabel("Z")
-    ax.set_zlabel("Y (height)")
-    ax.set_title("3D view")
-    ax.view_init(elev=18, azim=-60)
-    max_range = max(xs.max() - xs.min(), zs.max() - zs.min(), ys.max() - ys.min()) / 2.0
-    mid_x, mid_z, mid_y = (xs.max() + xs.min()) / 2, (zs.max() + zs.min()) / 2, (ys.max() + ys.min()) / 2
-    ax.set_xlim(mid_x - max_range, mid_x + max_range)
-    ax.set_ylim(mid_z - max_range, mid_z + max_range)
-    ax.set_zlim(mid_y - max_range, mid_y + max_range)
-
-    # --- top-down footprint view (the buildable surface) ---
-    top_y = ys.max()
-    mask = ys >= top_y - 0.5  # just the topmost layer (grass surface)
-    ax2 = fig.add_subplot(122)
-    ax2.scatter(xs[mask], zs[mask], c=[c for c, m in zip(colors, mask) if m],
-                marker="s", s=14, linewidths=0)
-    ax2.set_xlabel("X")
-    ax2.set_ylabel("Z")
-    ax2.set_title(f"Top-down footprint (buildable surface, Y={int(top_y)})")
-    ax2.set_aspect("equal")
-    ax2.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    if show:
-        plt.show()
-    plt.close(fig)
+def preview(structure, out_path="preview.png", title=None):
+    """Renders the island as full shaded blocks (one 3D screenshot in the
+    same style as islands_old's screenshots) and saves it to out_path."""
+    palette = {
+        name: (
+            int(color.lstrip("#")[0:2], 16) / 255.0,
+            int(color.lstrip("#")[2:4], 16) / 255.0,
+            int(color.lstrip("#")[4:6], 16) / 255.0,
+        )
+        for name, color in BLOCK_COLORS.items()
+    }
+    return render_screenshot(structure, out_path, title=title, palette=palette)
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +324,9 @@ def main():
     ap.add_argument("--no-underside-decor", action="store_true",
                      help="disable drips/vines/moss on the underside")
     ap.add_argument("--out", type=str, default="island", help="output file prefix")
-    ap.add_argument("--show", action="store_true", help="open an interactive 3D window")
+    ap.add_argument("--out-dir", type=Path, default=Path(__file__).parent / "out",
+                     dest="out_dir",
+                     help="directory for outputs (default: islands/out)")
     ap.add_argument("--scene", action="store_true",
                      help="generate the old multi-island demo scene instead of a single island")
     args = ap.parse_args()
@@ -373,17 +345,14 @@ def main():
             decorate_underside=not args.no_underside_decor,
         )
 
-    n_csv = export_block_list(blocks, f"{args.out}.csv", f"{args.out}.json")
-    print(f"Wrote {n_csv} blocks to {args.out}.csv / {args.out}.json")
+    structure = blocks_to_structure(blocks)
+    npz_path = structure.save(args.out_dir / f"{args.out}.npz")
+    print(f"Wrote {len(blocks)} blocks to {npz_path}")
 
-    try:
-        export_schem(blocks, f"{args.out}")
-        print(f"Wrote {args.out}.schem (WorldEdit: //schem load {args.out}  then  //paste)")
-    except Exception as e:
-        print(f"Skipped .schem export ({e}). CSV/JSON output is still complete.")
-
-    preview(blocks, out_path=f"{args.out}_preview.png", show=args.show)
-    print(f"Saved preview image to {args.out}_preview.png")
+    title = (f"multi-island demo scene (seed={args.seed})" if args.scene
+             else f"floating island (d={args.diameter}, seed={args.seed})")
+    png_path = preview(structure, out_path=args.out_dir / f"{args.out}.png", title=title)
+    print(f"Saved preview image to {png_path}")
 
 
 if __name__ == "__main__":
