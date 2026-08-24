@@ -196,6 +196,8 @@ def render_sheet(
 
     Each structure fills its own panel so panels can be compared for shape
     rather than absolute size. ``labels`` is an optional per-panel caption.
+    ``elev``/``azim`` set the camera; a negative ``elev`` looks up at the
+    model from below (useful for floating-island undersides).
     Returns the PNG path.
     """
     structures = list(structures)
